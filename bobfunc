@@ -1,549 +1,547 @@
-return function()
-	local Lighting = game:GetService("Lighting")
-	local RunService = game:GetService("RunService")
-	local TweenService = game:GetService("TweenService")
-	local Players = game:GetService("Players")
+local Lighting = game:GetService("Lighting")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
 
-	local player = Players.LocalPlayer
-	local cam = workspace.CurrentCamera
+local player = Players.LocalPlayer
+local cam = workspace.CurrentCamera
 
-	local atm = Lighting:FindFirstChildOfClass("Atmosphere")
-	if atm then
-		atm.Density = 0.8
-		atm.Offset = 0
-		atm.Color = Color3.new(0,0,0)
-		atm.Decay = Color3.new(0,0,0)
-		atm.Glare = 1
-		atm.Haze = 1
+local atm = Lighting:FindFirstChildOfClass("Atmosphere")
+if atm then
+	atm.Density = 0.8
+	atm.Offset = 0
+	atm.Color = Color3.new(0,0,0)
+	atm.Decay = Color3.new(0,0,0)
+	atm.Glare = 1
+	atm.Haze = 1
+end
+
+local sky = Lighting:FindFirstChildOfClass("Sky")
+if sky then
+	for _, f in ipairs({"SkyboxBk","SkyboxDn","SkyboxFt","SkyboxLf","SkyboxRt","SkyboxUp"}) do
+		sky[f] = "http://www.roblox.com/asset/?id=156311666"
 	end
+	sky.SunAngularSize = 0
+	sky.MoonAngularSize = 0
+end
 
-	local sky = Lighting:FindFirstChildOfClass("Sky")
-	if sky then
-		for _, f in ipairs({"SkyboxBk","SkyboxDn","SkyboxFt","SkyboxLf","SkyboxRt","SkyboxUp"}) do
-			sky[f] = "http://www.roblox.com/asset/?id=156311666"
-		end
-		sky.SunAngularSize = 0
-		sky.MoonAngularSize = 0
+local clouds = workspace.Terrain:FindFirstChildOfClass("Clouds")
+if clouds then clouds.Density = 0 end
+
+for _, v in ipairs(Lighting:GetDescendants()) do
+	if v:IsA("SunRaysEffect") then v:Destroy() end
+end
+
+local cc = Instance.new("ColorCorrectionEffect")
+cc.Saturation = -1
+cc.Parent = Lighting
+
+local motionBlur = Instance.new("BlurEffect")
+motionBlur.Size = 0
+motionBlur.Parent = Lighting
+
+local bloom = Instance.new("BloomEffect")
+bloom.Intensity = 0
+bloom.Size = 24
+bloom.Threshold = 0.95
+bloom.Parent = Lighting
+
+local bobPart = Instance.new("Attachment")
+bobPart.Name = "Bob"
+bobPart.WorldPosition = cam.CFrame.Position
+bobPart.Parent = workspace
+
+local bb = Instance.new("BillboardGui")
+bb.AlwaysOnTop = true
+bb.Size = UDim2.new(25,0,25,0)
+bb.Adornee = bobPart
+bb.Enabled = true
+bb.LightInfluence = 0
+bb.Parent = bobPart
+bb.MaxDistance = 100000
+bb.ClipsDescendants = false
+
+local img = Instance.new("ImageLabel")
+img.Image = "http://www.roblox.com/asset/?id=16802291466"
+img.Size = UDim2.new(1,0,1,0)
+img.BackgroundTransparency = 1
+img.Parent = bb
+
+local light = Instance.new("PointLight")
+light.Name = "BobLight"
+light.Color = Color3.fromRGB(255, 115, 73)
+light.Brightness = 0
+light.Range = 0
+light.Shadows = true
+light.Parent = bobPart
+
+local staticGui = Instance.new("ScreenGui")
+staticGui.Name = "StaticOverlay"
+staticGui.DisplayOrder = 9998
+staticGui.ResetOnSpawn = false
+staticGui.Parent = player.PlayerGui
+staticGui.IgnoreGuiInset = true
+
+local staticFrame = Instance.new("Frame")
+staticFrame.Size = UDim2.new(1,0,1,0)
+staticFrame.BackgroundTransparency = 1
+staticFrame.BorderSizePixel = 0
+staticFrame.Parent = staticGui
+
+local vignetteGui = Instance.new("ScreenGui")
+vignetteGui.Name = "VignetteOverlay"
+vignetteGui.DisplayOrder = 9997
+vignetteGui.ResetOnSpawn = false
+vignetteGui.Parent = player.PlayerGui
+vignetteGui.IgnoreGuiInset = true
+
+local vignetteImg = Instance.new("ImageLabel")
+vignetteImg.Size = UDim2.new(1,0,1,0)
+vignetteImg.BackgroundTransparency = 1
+vignetteImg.Image = "rbxassetid://2454009026"
+vignetteImg.ImageColor3 = Color3.new(0,0,0)
+vignetteImg.ImageTransparency = 1
+vignetteImg.ScaleType = Enum.ScaleType.Stretch
+vignetteImg.Parent = vignetteGui
+
+local redFlashGui = Instance.new("ScreenGui")
+redFlashGui.Name = "RedFlash"
+redFlashGui.DisplayOrder = 9996
+redFlashGui.ResetOnSpawn = false
+redFlashGui.Parent = player.PlayerGui
+redFlashGui.IgnoreGuiInset = true
+
+local redFrame = Instance.new("Frame")
+redFrame.Size = UDim2.new(1,0,1,0)
+redFrame.BackgroundColor3 = Color3.fromRGB(200,0,0)
+redFrame.BackgroundTransparency = 1
+redFrame.BorderSizePixel = 0
+redFrame.Parent = redFlashGui
+
+local function mksnd(id, vol, loop, parentWorkspace)
+	local s = Instance.new("Sound")
+	s.SoundId = id
+	s.Volume = vol
+	s.Looped = loop
+	s.RollOffMaxDistance = 9999
+	s.RollOffMinDistance = 9999
+	s.Parent = parentWorkspace and workspace or bobPart
+	return s
+end
+
+local idleSnd   = mksnd("rbxassetid://96727522170625",  6, true,  true)
+local farSnd    = mksnd("rbxassetid://128330435795908", 8, true,  false)
+local nearSnd   = mksnd("rbxassetid://123891336050396", 9, true,  false)
+local heartbeat = mksnd("rbxassetid://111549812299299", 0, true,  true)
+local aftersnd  = mksnd("rbxassetid://119379881800826", 0, true,  true)
+local after2snd = mksnd("rbxassetid://8880765497",      0, true,  true)
+
+local farDist = Instance.new("DistortionSoundEffect")
+farDist.Level = 0
+farDist.Parent = farSnd
+
+local nearDist = Instance.new("DistortionSoundEffect")
+nearDist.Level = 0
+nearDist.Parent = nearSnd
+
+local nearPitch = Instance.new("PitchShiftSoundEffect")
+nearPitch.Octave = 1
+nearPitch.Parent = nearSnd
+
+local stage = "nothing"
+local rage = RunService:IsStudio() and 90 or 0
+local lookCount = 0
+local lookCooldown = false
+local attacking = false
+local attackSpeed = 0
+local apporached = false
+
+local contrastFlipActive = false
+local contrastPhase = 1  
+local contrastFlipTimer = 0
+local contrastFlipInterval = 0.08
+
+local function fade(s, v, t)
+	TweenService:Create(s, TweenInfo.new(t), {Volume = v}):Play()
+end
+
+local function getCamPos() return cam.CFrame.Position end
+local function getHRP()
+	local c = player.Character
+	if c and c:FindFirstChild("HumanoidRootPart") then
+		return c.HumanoidRootPart.Position
 	end
+	return Vector3.new()
+end
 
-	local clouds = workspace.Terrain:FindFirstChildOfClass("Clouds")
-	if clouds then clouds.Density = 0 end
+local function inView(pos)
+	local _, onScreen = cam:WorldToScreenPoint(pos)
+	return onScreen
+end
 
-	for _, v in ipairs(Lighting:GetDescendants()) do
-		if v:IsA("SunRaysEffect") then v:Destroy() end
+local function offscreenPos(dist)
+	local base = getHRP()
+	for _ = 1, 100 do
+		local a = math.random() * math.pi * 2
+		local p = base + Vector3.new(math.cos(a) * dist, 0, math.sin(a) * dist)
+		if not inView(p) then return p end
 	end
-
-	local cc = Instance.new("ColorCorrectionEffect")
-	cc.Saturation = -1
-	cc.Parent = Lighting
-
-	local motionBlur = Instance.new("BlurEffect")
-	motionBlur.Size = 0
-	motionBlur.Parent = Lighting
-
-	local bloom = Instance.new("BloomEffect")
-	bloom.Intensity = 0
-	bloom.Size = 24
-	bloom.Threshold = 0.95
-	bloom.Parent = Lighting
-
-	local bobPart = Instance.new("Attachment")
-	bobPart.Name = "Bob"
-	bobPart.WorldPosition = cam.CFrame.Position
-	bobPart.Parent = workspace
-
-	local bb = Instance.new("BillboardGui")
-	bb.AlwaysOnTop = true
-	bb.Size = UDim2.new(25,0,25,0)
-	bb.Adornee = bobPart
-	bb.Enabled = true
-	bb.LightInfluence = 0
-	bb.Parent = bobPart
-	bb.MaxDistance = 100000
-	bb.ClipsDescendants = false
-
-	local img = Instance.new("ImageLabel")
-	img.Image = "http://www.roblox.com/asset/?id=16802291466"
-	img.Size = UDim2.new(1,0,1,0)
-	img.BackgroundTransparency = 1
-	img.Parent = bb
-
-	local light = Instance.new("PointLight")
-	light.Name = "BobLight"
-	light.Color = Color3.fromRGB(255, 115, 73)
-	light.Brightness = 0
-	light.Range = 0
-	light.Shadows = true
-	light.Parent = bobPart
-
-	local staticGui = Instance.new("ScreenGui")
-	staticGui.Name = "StaticOverlay"
-	staticGui.DisplayOrder = 9998
-	staticGui.ResetOnSpawn = false
-	staticGui.Parent = player.PlayerGui
-	staticGui.IgnoreGuiInset = true
-
-	local staticFrame = Instance.new("Frame")
-	staticFrame.Size = UDim2.new(1,0,1,0)
-	staticFrame.BackgroundTransparency = 1
-	staticFrame.BorderSizePixel = 0
-	staticFrame.Parent = staticGui
-
-	local vignetteGui = Instance.new("ScreenGui")
-	vignetteGui.Name = "VignetteOverlay"
-	vignetteGui.DisplayOrder = 9997
-	vignetteGui.ResetOnSpawn = false
-	vignetteGui.Parent = player.PlayerGui
-	vignetteGui.IgnoreGuiInset = true
-
-	local vignetteImg = Instance.new("ImageLabel")
-	vignetteImg.Size = UDim2.new(1,0,1,0)
-	vignetteImg.BackgroundTransparency = 1
-	vignetteImg.Image = "rbxassetid://2454009026"
-	vignetteImg.ImageColor3 = Color3.new(0,0,0)
-	vignetteImg.ImageTransparency = 1
-	vignetteImg.ScaleType = Enum.ScaleType.Stretch
-	vignetteImg.Parent = vignetteGui
-
-	local redFlashGui = Instance.new("ScreenGui")
-	redFlashGui.Name = "RedFlash"
-	redFlashGui.DisplayOrder = 9996
-	redFlashGui.ResetOnSpawn = false
-	redFlashGui.Parent = player.PlayerGui
-	redFlashGui.IgnoreGuiInset = true
-
-	local redFrame = Instance.new("Frame")
-	redFrame.Size = UDim2.new(1,0,1,0)
-	redFrame.BackgroundColor3 = Color3.fromRGB(200,0,0)
-	redFrame.BackgroundTransparency = 1
-	redFrame.BorderSizePixel = 0
-	redFrame.Parent = redFlashGui
-
-	local function mksnd(id, vol, loop, parentWorkspace)
-		local s = Instance.new("Sound")
-		s.SoundId = id
-		s.Volume = vol
-		s.Looped = loop
-		s.RollOffMaxDistance = 9999
-		s.RollOffMinDistance = 9999
-		s.Parent = parentWorkspace and workspace or bobPart
-		return s
-	end
-
-	local idleSnd   = mksnd("rbxassetid://96727522170625",  6, true,  true)
-	local farSnd    = mksnd("rbxassetid://128330435795908", 8, true,  false)
-	local nearSnd   = mksnd("rbxassetid://123891336050396", 9, true,  false)
-	local heartbeat = mksnd("rbxassetid://111549812299299", 0, true,  true)
-	local aftersnd  = mksnd("rbxassetid://119379881800826", 0, true,  true)
-	local after2snd = mksnd("rbxassetid://8880765497",      0, true,  true)
-
-	local farDist = Instance.new("DistortionSoundEffect")
-	farDist.Level = 0
-	farDist.Parent = farSnd
-
-	local nearDist = Instance.new("DistortionSoundEffect")
-	nearDist.Level = 0
-	nearDist.Parent = nearSnd
-
-	local nearPitch = Instance.new("PitchShiftSoundEffect")
-	nearPitch.Octave = 1
-	nearPitch.Parent = nearSnd
-
-	local stage = "nothing"
-	local rage = RunService:IsStudio() and 90 or 0
-	local lookCount = 0
-	local lookCooldown = false
-	local attacking = false
-	local attackSpeed = 0
-	local apporached = false
-
-	local contrastFlipActive = false
-	local contrastPhase = 1  
-	local contrastFlipTimer = 0
-	local contrastFlipInterval = 0.08
-
-	local function fade(s, v, t)
-		TweenService:Create(s, TweenInfo.new(t), {Volume = v}):Play()
-	end
-
-	local function getCamPos() return cam.CFrame.Position end
-	local function getHRP()
-		local c = player.Character
-		if c and c:FindFirstChild("HumanoidRootPart") then
-			return c.HumanoidRootPart.Position
-		end
-		return Vector3.new()
-	end
-
-	local function inView(pos)
-		local _, onScreen = cam:WorldToScreenPoint(pos)
-		return onScreen
-	end
-
-	local function offscreenPos(dist)
-		local base = getHRP()
-		for _ = 1, 100 do
-			local a = math.random() * math.pi * 2
-			local p = base + Vector3.new(math.cos(a) * dist, 0, math.sin(a) * dist)
-			if not inView(p) then return p end
-		end
-		return base + Vector3.new(dist, 0, 0)
-	end
-
-	local function triggerContrastFlash(intensity)
-		task.spawn(function()
-			cc.Contrast = -intensity * 1.8
-			cc.TintColor = Color3.fromRGB(255, 0, 0)
-			cc.Brightness = -intensity * 0.6
-			task.wait(contrastFlipInterval * 0.7)
-
-			cc.Contrast = intensity * 2.2
-			cc.TintColor = Color3.fromRGB(255, 255, 255)
-			cc.Brightness = intensity * 0.8
-			task.wait(contrastFlipInterval * 0.7)
-
-			cc.Contrast = -intensity * 1.2
-			cc.TintColor = Color3.fromRGB(180, 0, 0)
-			cc.Brightness = -intensity * 0.3
-			task.wait(contrastFlipInterval * 0.5)
-
-			cc.Contrast = 0
-			cc.Brightness = 0
-			cc.TintColor = Color3.new(1,1,1)
-		end)
-	end
-
-	local function flashRed(alpha, duration)
-		TweenService:Create(redFrame, TweenInfo.new(0.04), {BackgroundTransparency = 1 - alpha}):Play()
-		task.delay(duration or 0.12, function()
-			TweenService:Create(redFrame, TweenInfo.new(0.18), {BackgroundTransparency = 1}):Play()
-		end)
-	end
-
-	local function setStage(newStage)
-		stage = newStage
-
-		if newStage == "nothing" then
-			bb.Enabled = false
-			bobPart.WorldPosition = Vector3.new(0, 50000, 0)
-			idleSnd.Volume = 3
-			idleSnd:Play()
-			heartbeat:Play()
-
-			farSnd:Stop()
-			nearSnd:Stop()
-
-			motionBlur.Size = 0
-			bloom.Intensity = 0
-			attacking = false
-
-		elseif newStage == "stalking" then
-			local p = offscreenPos(math.random(60, 90))
-			bobPart.WorldPosition = Vector3.new(p.X, getHRP().Y + 5, p.Z)
-			bb.Enabled = true
-			idleSnd.Volume = 0.4
-			idleSnd:Stop()
-
-		elseif newStage == "attacking" then
-			local p = offscreenPos(math.random(180, 280))
-			bobPart.WorldPosition = Vector3.new(p.X, getHRP().Y + 5, p.Z)
-			bb.Enabled = true
-
-			fade(idleSnd, 0, 1)
-			task.delay(1, function() idleSnd:Stop() end)
-
-			farSnd:Play()
-			attackSpeed = 8
-			attacking = true
-
-			task.spawn(function()
-				task.wait(0.1)
-				triggerContrastFlash(0.9)
-				flashRed(0.45, 0.1)
-			end)
-
-		elseif newStage == "kickmessage" then
-			bb.Enabled = false
-			bobPart.WorldPosition = Vector3.new(0, 50000, 0)
-			idleSnd:Stop()
-			heartbeat:Stop()
-
-			farSnd:Stop()
-			nearSnd:Stop()
-
-			attacking = false
-			player.Character.HumanoidRootPart.Anchored = true
-
-			local blur = Instance.new("BlurEffect", game.Lighting)
-			blur.Size = 0
-			TweenService:Create(blur, TweenInfo.new(0.15), {Size = 24}):Play()
-
-			for _, v in pairs(game.SoundService:GetDescendants()) do
-				if v:IsA("SoundGroup") then v.Volume = 0 end
-			end
-
-			local kickui = Instance.new("ScreenGui", player.PlayerGui)
-			kickui.DisplayOrder = 9999
-			local ContentProvider = game:GetService("ContentProvider")
-			ContentProvider:PreloadAsync({"rbxassetid://114151752628447"})
-			local fakekick = Instance.new("ImageLabel", kickui)
-			fakekick.BackgroundTransparency = 1
-			fakekick.Image = "rbxassetid://114151752628447"
-			fakekick.Size = UDim2.new(0,0,0,0)
-			fakekick.Visible = true
-			game.UserInputService.MouseIconEnabled = true
-			TweenService:Create(fakekick, TweenInfo.new(0.15), {Size = UDim2.new(0, 352,0, 220)}):Play()
-			fakekick.AnchorPoint = Vector2.new(0.5, 0.5)
-			fakekick.Position = UDim2.fromScale(0.5, 0.5)
-
-			local button1 = Instance.new("TextButton", fakekick)
-			button1.BackgroundTransparency = 1; button1.Text = ""
-			button1.Size = UDim2.new(0,157,0,30); button1.Modal = true
-			button1.Position = UDim2.new(0.51,0,0.78,0)
-
-			local button2 = Instance.new("TextButton", fakekick)
-			button2.BackgroundTransparency = 1; button2.Text = ""
-			button2.Size = UDim2.new(0,157,0,30); button2.Modal = true
-			button2.Position = UDim2.new(0.047,0,0.78,0)
-
-			local start = workspace.DistributedGameTime
-			local rnd = math.random(4, 15)
-
-			button1.MouseButton1Click:Connect(function() rnd = 0 end)
-			button2.MouseButton1Click:Connect(function() rnd = 0 end)
-
-			while wait() do
-				if workspace.DistributedGameTime - start > rnd then break end
-			end
-
-			kickui:Destroy()
-			blur:Destroy()
-			cc.Enabled = false
-			motionBlur.Size = 0
-			bloom.Intensity = 0
-			vignetteImg.ImageTransparency = 1
-			redFrame.BackgroundTransparency = 1
-			player.Character.HumanoidRootPart.Anchored = false
-			after2snd:Play()
-			fade(after2snd, 10, 0.01)
-
-			atm.Color = Color3.fromRGB(255,255,255)
-			atm.Decay = Color3.fromRGB(255,255,255)
-			atm.Density = 1
-
-			cc.Enabled = true
-
-			wait(20)
-			local p = offscreenPos(math.random(350, 400))
-			bobPart.WorldPosition = Vector3.new(p.X, getHRP().Y + 5, p.Z)
-			bb.Enabled = true
-			rage = 25
-			wait(4)
-			bb.Enabled = false
-			wait(3)
-			lookCooldown = false
-			setStage("stalking")
-		end
-	end
-
-	local function spawnSphere(closeness)
-		local origin = getHRP()
-		local offset = Vector3.new(math.random(-30, 30), 50, math.random(-30, 30))
-		local rayOrigin = origin + offset
-		local rayDir = Vector3.new(0, -200, 0)
-
-		local params = RaycastParams.new()
-		params.FilterDescendantsInstances = {player.Character}
-		params.FilterType = Enum.RaycastFilterType.Blacklist
-
-		local result = workspace:Raycast(rayOrigin, rayDir, params)
-		if not result then return end
-
-		local pos = result.Position + Vector3.new(0, 2, 0)
-		local p = Instance.new("Part")
-		p.Shape = Enum.PartType.Ball
-		p.Size = Vector3.new(1,1,1)
-		p.Position = pos
-		p.Anchored = true
-		p.CanCollide = false
-		p.Material = Enum.Material.Glass
-		p.Transparency = 1
-		p.Parent = workspace
-
-		local h = Instance.new("Highlight")
-		h.Adornee = p
-		h.FillTransparency = -50
-		h.Parent = p
-
-		local grow = math.random(0,1) == 1
-		local startSize = grow and Vector3.new(1,1,1) or Vector3.new(25,25,25)
-		local endSize   = grow and Vector3.new(25,25,25) or Vector3.new(1,1,1)
-		p.Size = startSize
-
-		local tweenTime = 0.6 + math.random() * 0.6
-		TweenService:Create(p, TweenInfo.new(tweenTime, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-			Size = endSize,
-			Transparency = 1
-		}):Play()
-
-		game.Debris:AddItem(p, tweenTime + 0.1)
-	end
-
-	RunService.Heartbeat:Connect(function()
-		if stage ~= "stalking" or lookCooldown then return end
-
-		if inView(bobPart.WorldPosition) then
-			lookCooldown = true
-			if math.random(1,2) == 1 then
-				wait(math.random(10,100)/1000)
-			end
-			lookCount += 1
-			rage = math.min(rage + 25 * (2 ^ (lookCount - 1)), 100)
-
-			if rage >= 100 then
-				setStage("attacking")
-			else
-				setStage("nothing")
-				task.delay(math.random(7, 25), function()
-					if stage == "nothing" then
-						setStage("stalking")
-						lookCooldown = false
-					end
-				end)
-			end
-		end
-	end)
-
-	local contrastCooldown = 0
-
-	RunService.Heartbeat:Connect(function(dt)
-		if not attacking then return end
-
-		local cp = getCamPos()
-		local dist = (bobPart.WorldPosition - cp).Magnitude
-		local closeness  = math.clamp(1 - (dist / 280), 0, 1)
-		local closeness2 = math.clamp(1 - (dist / 45),  0, 1) 
-
-		heartbeat.Volume        = closeness * 6
-		heartbeat.PlaybackSpeed = math.clamp(0.1 + closeness ^ 1.5, 0.1, 2.4)
-
-		light.Brightness = closeness2 * 8
-		light.Range       = closeness2 * 25
-
-		after2snd.Volume = 6 + closeness * 3
-		
-		local distortion = closeness * 1.5
-		farDist.Level  = distortion
-		nearDist.Level = distortion
-
-		nearPitch.Octave = math.clamp(1 - closeness2 * 0.35, 0.65, 1)
-
-		motionBlur.Size = closeness * 18
-		bloom.Intensity = closeness2 * 2.5
-		vignetteImg.ImageTransparency = 1 - closeness * 0.85
-
-		cc.TintColor  = Color3.fromRGB(
-			255 * (1 - closeness * 0.6),
-			255 * (1 - closeness),
-			255 * (1 - closeness)
-		)
-		cc.Contrast   = closeness * 0.6
-		cc.Brightness = closeness * 0.2
-
-		contrastCooldown = contrastCooldown - dt
-
-		if closeness > 0.25 and contrastCooldown <= 0 then
-			local flashInterval = math.clamp(1.5 - closeness * 1.45, 0.05, 1.5)
-			contrastCooldown = flashInterval
-
-			local flashIntensity = closeness
-
-			task.spawn(function()
-				cc.Contrast   = -flashIntensity * 2.5
-				cc.TintColor  = Color3.fromRGB(180, 0, 0)
-				cc.Brightness = -flashIntensity * 0.9
-
-				task.wait(0.04)
-
-				cc.Contrast   =  flashIntensity * 3.0
-				cc.TintColor  = Color3.new(1, 1, 1)
-				cc.Brightness =  flashIntensity * 1.0
-
-				task.wait(0.035)
-
-				if closeness > 0.6 then
-					cc.Contrast   = -flashIntensity * 1.8
-					cc.TintColor  = Color3.fromRGB(100, 0, 0)
-					cc.Brightness = -flashIntensity * 0.5
-					task.wait(0.03)
-				end
-
-				cc.Contrast   = closeness * 0.6
-				cc.TintColor  = Color3.fromRGB(
-					255 * (1 - closeness * 0.6),
-					255 * (1 - closeness),
-					255 * (1 - closeness)
-				)
-				cc.Brightness = closeness * 0.2
-			end)
-
-			flashRed(closeness * 0.55, 0.06)
-		end
-
-		if closeness > 0.3 and math.random(1, 6) == 1 then
-			cc.Enabled = false
-			task.delay(0.05, function()
-				cc.Enabled = true
-			end)
-		end
-
-		local intensity = closeness
-		if intensity > 0 then
-			local shakeX = (math.random() - 0.5) * 2 * intensity * 7
-			local shakeY = (math.random() - 0.5) * 2 * intensity * 7
-			local shakeZ = (math.random() - 0.5) * 2 * intensity * 5
-			cam.CFrame = cam.CFrame * CFrame.Angles(
-				math.rad(shakeX),
-				math.rad(shakeY),
-				math.rad(shakeZ)
-			)
-		end
-
-		local spawnChance = math.clamp(closeness2 * 0.5, 0, 0.5)
-		if math.random() < spawnChance then
-			task.spawn(function() spawnSphere(closeness2) end)
-		end
-
-		if dist > 30 then
-			if not farSnd.IsPlaying then farSnd:Play() end
-			fade(farSnd, 7, 0.4)
-			fade(nearSnd, 0, 0.4)
-		else
-			fade(farSnd, 0, 0.4)
-			if not nearSnd.IsPlaying then nearSnd:Play() end
-			fade(nearSnd, 9, 0.4)
-		end
-
-		if dist <= 2 then
-			attacking = false
-			bb.Enabled = false
-			if not apporached then
-				setStage("kickmessage")
-				apporached = true
-			else
-				if not RunService:IsStudio() then while true do end end
-			end
-		end
-
-		attackSpeed = math.min(attackSpeed + dt * 12, 55)
-		bobPart.WorldPosition = bobPart.WorldPosition + (cp - bobPart.WorldPosition).Unit * attackSpeed * dt
-	end)
-
-	setStage("nothing")
-
-	task.delay(math.random(15, 40), function()
-		if stage == "nothing" then
-			setStage("stalking")
-		end
+	return base + Vector3.new(dist, 0, 0)
+end
+
+local function triggerContrastFlash(intensity)
+	task.spawn(function()
+		cc.Contrast = -intensity * 1.8
+		cc.TintColor = Color3.fromRGB(255, 0, 0)
+		cc.Brightness = -intensity * 0.6
+		task.wait(contrastFlipInterval * 0.7)
+
+		cc.Contrast = intensity * 2.2
+		cc.TintColor = Color3.fromRGB(255, 255, 255)
+		cc.Brightness = intensity * 0.8
+		task.wait(contrastFlipInterval * 0.7)
+
+		cc.Contrast = -intensity * 1.2
+		cc.TintColor = Color3.fromRGB(180, 0, 0)
+		cc.Brightness = -intensity * 0.3
+		task.wait(contrastFlipInterval * 0.5)
+
+		cc.Contrast = 0
+		cc.Brightness = 0
+		cc.TintColor = Color3.new(1,1,1)
 	end)
 end
+
+local function flashRed(alpha, duration)
+	TweenService:Create(redFrame, TweenInfo.new(0.04), {BackgroundTransparency = 1 - alpha}):Play()
+	task.delay(duration or 0.12, function()
+		TweenService:Create(redFrame, TweenInfo.new(0.18), {BackgroundTransparency = 1}):Play()
+	end)
+end
+
+local function setStage(newStage)
+	stage = newStage
+
+	if newStage == "nothing" then
+		bb.Enabled = false
+		bobPart.WorldPosition = Vector3.new(0, 50000, 0)
+		idleSnd.Volume = 3
+		idleSnd:Play()
+		heartbeat:Play()
+
+		farSnd:Stop()
+		nearSnd:Stop()
+
+		motionBlur.Size = 0
+		bloom.Intensity = 0
+		attacking = false
+
+	elseif newStage == "stalking" then
+		local p = offscreenPos(math.random(60, 90))
+		bobPart.WorldPosition = Vector3.new(p.X, getHRP().Y + 5, p.Z)
+		bb.Enabled = true
+		idleSnd.Volume = 0.4
+		idleSnd:Stop()
+
+	elseif newStage == "attacking" then
+		local p = offscreenPos(math.random(180, 280))
+		bobPart.WorldPosition = Vector3.new(p.X, getHRP().Y + 5, p.Z)
+		bb.Enabled = true
+
+		fade(idleSnd, 0, 1)
+		task.delay(1, function() idleSnd:Stop() end)
+
+		farSnd:Play()
+		attackSpeed = 8
+		attacking = true
+
+		task.spawn(function()
+			task.wait(0.1)
+			triggerContrastFlash(0.9)
+			flashRed(0.45, 0.1)
+		end)
+
+	elseif newStage == "kickmessage" then
+		bb.Enabled = false
+		bobPart.WorldPosition = Vector3.new(0, 50000, 0)
+		idleSnd:Stop()
+		heartbeat:Stop()
+
+		farSnd:Stop()
+		nearSnd:Stop()
+
+		attacking = false
+		player.Character.HumanoidRootPart.Anchored = true
+
+		local blur = Instance.new("BlurEffect", game.Lighting)
+		blur.Size = 0
+		TweenService:Create(blur, TweenInfo.new(0.15), {Size = 24}):Play()
+
+		for _, v in pairs(game.SoundService:GetDescendants()) do
+			if v:IsA("SoundGroup") then v.Volume = 0 end
+		end
+
+		local kickui = Instance.new("ScreenGui", player.PlayerGui)
+		kickui.DisplayOrder = 9999
+		local ContentProvider = game:GetService("ContentProvider")
+		ContentProvider:PreloadAsync({"rbxassetid://114151752628447"})
+		local fakekick = Instance.new("ImageLabel", kickui)
+		fakekick.BackgroundTransparency = 1
+		fakekick.Image = "rbxassetid://114151752628447"
+		fakekick.Size = UDim2.new(0,0,0,0)
+		fakekick.Visible = true
+		game.UserInputService.MouseIconEnabled = true
+		TweenService:Create(fakekick, TweenInfo.new(0.15), {Size = UDim2.new(0, 352,0, 220)}):Play()
+		fakekick.AnchorPoint = Vector2.new(0.5, 0.5)
+		fakekick.Position = UDim2.fromScale(0.5, 0.5)
+
+		local button1 = Instance.new("TextButton", fakekick)
+		button1.BackgroundTransparency = 1; button1.Text = ""
+		button1.Size = UDim2.new(0,157,0,30); button1.Modal = true
+		button1.Position = UDim2.new(0.51,0,0.78,0)
+
+		local button2 = Instance.new("TextButton", fakekick)
+		button2.BackgroundTransparency = 1; button2.Text = ""
+		button2.Size = UDim2.new(0,157,0,30); button2.Modal = true
+		button2.Position = UDim2.new(0.047,0,0.78,0)
+
+		local start = workspace.DistributedGameTime
+		local rnd = math.random(4, 15)
+
+		button1.MouseButton1Click:Connect(function() rnd = 0 end)
+		button2.MouseButton1Click:Connect(function() rnd = 0 end)
+
+		while wait() do
+			if workspace.DistributedGameTime - start > rnd then break end
+		end
+
+		kickui:Destroy()
+		blur:Destroy()
+		cc.Enabled = false
+		motionBlur.Size = 0
+		bloom.Intensity = 0
+		vignetteImg.ImageTransparency = 1
+		redFrame.BackgroundTransparency = 1
+		player.Character.HumanoidRootPart.Anchored = false
+		after2snd:Play()
+		fade(after2snd, 10, 0.01)
+
+		atm.Color = Color3.fromRGB(255,255,255)
+		atm.Decay = Color3.fromRGB(255,255,255)
+		atm.Density = 1
+
+		cc.Enabled = true
+
+		wait(20)
+		local p = offscreenPos(math.random(350, 400))
+		bobPart.WorldPosition = Vector3.new(p.X, getHRP().Y + 5, p.Z)
+		bb.Enabled = true
+		rage = 25
+		wait(4)
+		bb.Enabled = false
+		wait(3)
+		lookCooldown = false
+		setStage("stalking")
+	end
+end
+
+local function spawnSphere(closeness)
+	local origin = getHRP()
+	local offset = Vector3.new(math.random(-30, 30), 50, math.random(-30, 30))
+	local rayOrigin = origin + offset
+	local rayDir = Vector3.new(0, -200, 0)
+
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = {player.Character}
+	params.FilterType = Enum.RaycastFilterType.Blacklist
+
+	local result = workspace:Raycast(rayOrigin, rayDir, params)
+	if not result then return end
+
+	local pos = result.Position + Vector3.new(0, 2, 0)
+	local p = Instance.new("Part")
+	p.Shape = Enum.PartType.Ball
+	p.Size = Vector3.new(1,1,1)
+	p.Position = pos
+	p.Anchored = true
+	p.CanCollide = false
+	p.Material = Enum.Material.Glass
+	p.Transparency = 1
+	p.Parent = workspace
+
+	local h = Instance.new("Highlight")
+	h.Adornee = p
+	h.FillTransparency = -50
+	h.Parent = p
+
+	local grow = math.random(0,1) == 1
+	local startSize = grow and Vector3.new(1,1,1) or Vector3.new(25,25,25)
+	local endSize   = grow and Vector3.new(25,25,25) or Vector3.new(1,1,1)
+	p.Size = startSize
+
+	local tweenTime = 0.6 + math.random() * 0.6
+	TweenService:Create(p, TweenInfo.new(tweenTime, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Size = endSize,
+		Transparency = 1
+	}):Play()
+
+	game.Debris:AddItem(p, tweenTime + 0.1)
+end
+
+RunService.Heartbeat:Connect(function()
+	if stage ~= "stalking" or lookCooldown then return end
+
+	if inView(bobPart.WorldPosition) then
+		lookCooldown = true
+		if math.random(1,2) == 1 then
+			wait(math.random(10,100)/1000)
+		end
+		lookCount += 1
+		rage = math.min(rage + 25 * (2 ^ (lookCount - 1)), 100)
+
+		if rage >= 100 then
+			setStage("attacking")
+		else
+			setStage("nothing")
+			task.delay(math.random(7, 25), function()
+				if stage == "nothing" then
+					setStage("stalking")
+					lookCooldown = false
+				end
+			end)
+		end
+	end
+end)
+
+local contrastCooldown = 0
+
+RunService.Heartbeat:Connect(function(dt)
+	if not attacking then return end
+
+	local cp = getCamPos()
+	local dist = (bobPart.WorldPosition - cp).Magnitude
+	local closeness  = math.clamp(1 - (dist / 280), 0, 1)
+	local closeness2 = math.clamp(1 - (dist / 45),  0, 1) 
+
+	heartbeat.Volume        = closeness * 6
+	heartbeat.PlaybackSpeed = math.clamp(0.1 + closeness ^ 1.5, 0.1, 2.4)
+
+	light.Brightness = closeness2 * 8
+	light.Range       = closeness2 * 25
+
+	after2snd.Volume = 6 + closeness * 3
+
+	local distortion = closeness * 1.5
+	farDist.Level  = distortion
+	nearDist.Level = distortion
+
+	nearPitch.Octave = math.clamp(1 - closeness2 * 0.35, 0.65, 1)
+
+	motionBlur.Size = closeness * 18
+	bloom.Intensity = closeness2 * 2.5
+	vignetteImg.ImageTransparency = 1 - closeness * 0.85
+
+	cc.TintColor  = Color3.fromRGB(
+		255 * (1 - closeness * 0.6),
+		255 * (1 - closeness),
+		255 * (1 - closeness)
+	)
+	cc.Contrast   = closeness * 0.6
+	cc.Brightness = closeness * 0.2
+
+	contrastCooldown = contrastCooldown - dt
+
+	if closeness > 0.25 and contrastCooldown <= 0 then
+		local flashInterval = math.clamp(1.5 - closeness * 1.45, 0.05, 1.5)
+		contrastCooldown = flashInterval
+
+		local flashIntensity = closeness
+
+		task.spawn(function()
+			cc.Contrast   = -flashIntensity * 2.5
+			cc.TintColor  = Color3.fromRGB(180, 0, 0)
+			cc.Brightness = -flashIntensity * 0.9
+
+			task.wait(0.04)
+
+			cc.Contrast   =  flashIntensity * 3.0
+			cc.TintColor  = Color3.new(1, 1, 1)
+			cc.Brightness =  flashIntensity * 1.0
+
+			task.wait(0.035)
+
+			if closeness > 0.6 then
+				cc.Contrast   = -flashIntensity * 1.8
+				cc.TintColor  = Color3.fromRGB(100, 0, 0)
+				cc.Brightness = -flashIntensity * 0.5
+				task.wait(0.03)
+			end
+
+			cc.Contrast   = closeness * 0.6
+			cc.TintColor  = Color3.fromRGB(
+				255 * (1 - closeness * 0.6),
+				255 * (1 - closeness),
+				255 * (1 - closeness)
+			)
+			cc.Brightness = closeness * 0.2
+		end)
+
+		flashRed(closeness * 0.55, 0.06)
+	end
+
+	if closeness > 0.3 and math.random(1, 6) == 1 then
+		cc.Enabled = false
+		task.delay(0.05, function()
+			cc.Enabled = true
+		end)
+	end
+
+	local intensity = closeness
+	if intensity > 0 then
+		local shakeX = (math.random() - 0.5) * 2 * intensity * 7
+		local shakeY = (math.random() - 0.5) * 2 * intensity * 7
+		local shakeZ = (math.random() - 0.5) * 2 * intensity * 5
+		cam.CFrame = cam.CFrame * CFrame.Angles(
+			math.rad(shakeX),
+			math.rad(shakeY),
+			math.rad(shakeZ)
+		)
+	end
+
+	local spawnChance = math.clamp(closeness2 * 0.5, 0, 0.5)
+	if math.random() < spawnChance then
+		task.spawn(function() spawnSphere(closeness2) end)
+	end
+
+	if dist > 30 then
+		if not farSnd.IsPlaying then farSnd:Play() end
+		fade(farSnd, 7, 0.4)
+		fade(nearSnd, 0, 0.4)
+	else
+		fade(farSnd, 0, 0.4)
+		if not nearSnd.IsPlaying then nearSnd:Play() end
+		fade(nearSnd, 9, 0.4)
+	end
+
+	if dist <= 2 then
+		attacking = false
+		bb.Enabled = false
+		if not apporached then
+			setStage("kickmessage")
+			apporached = true
+		else
+			if not RunService:IsStudio() then while true do end end
+		end
+	end
+
+	attackSpeed = math.min(attackSpeed + dt * 12, 55)
+	bobPart.WorldPosition = bobPart.WorldPosition + (cp - bobPart.WorldPosition).Unit * attackSpeed * dt
+end)
+
+setStage("nothing")
+
+task.delay(math.random(15, 40), function()
+	if stage == "nothing" then
+		setStage("stalking")
+	end
+end)
