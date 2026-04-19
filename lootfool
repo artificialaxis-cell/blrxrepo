@@ -1,0 +1,104 @@
+local Loot = workspace:WaitForChild("Debris"):WaitForChild("Loot")
+local UIS = game:GetService("UserInputService")
+local activeBags, lootConn, dead = {}, nil, false
+
+workspace.DescendantAdded:Connect(function(child)
+	if child.Parent.Name == "LootTable" and (child.Name == "Purple Keycard" or child.Name == "Blue Keycard") then
+		child.Name = "Red Keycard"
+		child:SetAttribute("ISFAKE",true)
+	elseif child.Parent.Name == "LootTable" and child.Name == "Red Keycard" then
+		child.Name = "Purple Keycard"
+
+	end
+end)
+
+game.Players.LocalPlayer.DescendantAdded:Connect(function(child)
+	if (child.Name == "Purple Keycard" or child.Name == "Blue Keycard") then
+		child.Name = "Red Keycard"
+		child:SetAttribute("ISFAKE",true)
+	elseif child.Name == "Red Keycard" then
+		child.Name = "Purple Keycard"
+	end
+end)
+
+local function hasCard(bag)
+	wait()
+	for _, d in ipairs(bag:GetDescendants()) do if d.Name == "Red Keycard" and d:GetAttribute("ISFAKE") then return true end end
+	local lt = bag:FindFirstChild("LootTable")
+	if lt then for _, c in ipairs(lt:GetChildren()) do if c.Name == "Red Keycard" and c:GetAttribute("ISFAKE") then  return true end end end
+end
+
+local function removeAll(bag)
+	for _, n in ipairs({"RedKeycardHighlight","RedKeycardAttachment","RedKeycardBillboard"}) do
+		local x = bag:FindFirstChild(n) if x then x:Destroy() end
+	end
+end
+
+local function addAll(bag)
+	local hl = Instance.new("Highlight"); hl.Name="RedKeycardHighlight"; hl.FillColor=Color3.fromRGB(255,0,0); hl.OutlineColor=Color3.fromRGB(255,0,0); hl.FillTransparency=0.4; hl.OutlineTransparency=1; hl.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop; hl.Adornee=bag; hl.Parent=bag
+
+	local att = Instance.new("Attachment"); att.Name="RedKeycardAttachment"; att.Position=Vector3.new(0,3,0); att.Parent=bag
+
+	local snd = Instance.new("Sound"); snd.SoundId="rbxassetid://122214548136616"; snd.Volume=2; snd.Looped=false; snd.RollOffMaxDistance=6000000; snd.RollOffMinDistance=6000000; snd.Parent=bag; snd:Play()
+
+	local bb = Instance.new("BillboardGui"); bb.Name="RedKeycardBillboard"; bb.Adornee=att; bb.Size=UDim2.new(0,180,0,80); bb.StudsOffset=Vector3.new(0,1.5,0); bb.AlwaysOnTop=true; bb.LightInfluence=1; bb.Parent=bag
+
+	local function lbl(text, pos)
+		local l = Instance.new("TextLabel"); l.Size=UDim2.new(1,0,0.55,0); l.Position=pos; l.BackgroundTransparency=1; l.Text=text; l.TextColor3=Color3.fromRGB(255,40,40); l.TextScaled=true; l.Font=Enum.Font.GothamBold; l.Parent=bb
+		local s = Instance.new("UIStroke"); s.Color=Color3.fromRGB(0,0,0); s.Thickness=2; s.Parent=l
+		return l
+	end
+
+	local arrow = lbl("↓", UDim2.new(0,0,0,0)); arrow.Size=UDim2.new(1,0,0.45,0)
+	lbl("! RED KEYCARD !", UDim2.new(0,0,0.45,0))
+
+	task.spawn(function()
+		local flip = true
+		while arrow and arrow.Parent do arrow.Position = flip and UDim2.new(0,0,0,-4) or UDim2.new(0,0,0,0); flip=not flip; task.wait(0.45) end
+	end)
+end
+
+local function update(bag)
+	if hasCard(bag) then if not bag:FindFirstChild("RedKeycardHighlight") then addAll(bag) end
+	else removeAll(bag) end
+end
+
+local function selfDestruct()
+	if dead then return end; dead=true
+	if lootConn then lootConn:Disconnect() end
+	for bag, data in pairs(activeBags) do for _, c in ipairs(data.connections) do c:Disconnect() end; removeAll(bag) end
+	activeBags={}; print("[RedKeycard Tracker] Self-destructed.")
+end
+
+local function watchBag(bag)
+	if dead or activeBags[bag] then return end
+	local conns = {}; activeBags[bag]={connections=conns}
+	update(bag)
+
+	local function hook(obj)
+		table.insert(conns, obj.ChildAdded:Connect(function(c) if c.Name=="Red Keycard" and c:GetAttribute("ISFAKE") then update(bag) end end))
+		table.insert(conns, obj.ChildRemoved:Connect(function(c) if c.Name=="Red Keycard" and c:GetAttribute("ISFAKE") then task.defer(function() update(bag) end) end end))
+	end
+
+	table.insert(conns, bag.DescendantAdded:Connect(function(d)
+		if d.Name=="Red Keycard" then update(bag) end
+		if d.Name=="LootTable" then hook(d) end
+	end))
+	table.insert(conns, bag.DescendantRemoving:Connect(function(d)
+		if d.Name=="Red Keycard" then task.defer(function() update(bag) end) end
+	end))
+
+	local lt = bag:FindFirstChild("LootTable"); if lt then hook(lt) end
+
+	table.insert(conns, bag.AncestryChanged:Connect(function(_, p)
+		if not p or not bag:IsDescendantOf(Loot) then
+			if activeBags[bag] then for _, c in ipairs(activeBags[bag].connections) do c:Disconnect() end; activeBags[bag]=nil end
+			removeAll(bag)
+		end
+	end))
+end
+
+UIS.InputBegan:Connect(function(i, gp) if not gp and i.KeyCode==Enum.KeyCode.J then selfDestruct() end end)
+
+lootConn = Loot.ChildAdded:Connect(watchBag)
+for _, bag in ipairs(Loot:GetChildren()) do watchBag(bag) end
