@@ -1,0 +1,235 @@
+local HttpService     = game:GetService("HttpService")
+local MaterialService = game:GetService("MaterialService")
+
+
+local function dV3(t)  return Vector3.new(t[1], t[2], t[3]) end
+local function dC3(t)  return Color3.new(t[1], t[2], t[3]) end
+local function dCF(t)  return CFrame.new(table.unpack(t)) end
+local function dV2(t)  return Vector2.new(t[1], t[2]) end
+
+local function decodeValue(v)
+	if type(v) ~= "table" then return v end 
+	local t = v._t
+	if t == "v3" then return dV3(v.v)
+	elseif t == "c3" then return dC3(v.v)
+	elseif t == "cf" then return dCF(v.v)
+	elseif t == "v2" then return dV2(v.v)
+	elseif t == "en" then
+		local ok, enumType = pcall(function() return Enum[v.v.cat] end)
+		if not ok then return nil end
+		local ok2, item = pcall(function() return enumType[v.v.val] end)
+		return ok2 and item or nil
+	end
+	return nil
+end
+
+local function resolvePath(root, path)
+	if path == nil then return nil end
+	if path == ""  then return root end
+	local cur = root
+	for segment in string.gmatch(path, "[^/]+") do
+		if cur == nil then return nil end
+		cur = cur:FindFirstChild(segment)
+	end
+	return cur
+end
+
+local function trySet(inst, prop, rawVal)
+	local val = decodeValue(rawVal)
+	if val == nil then return end
+	pcall(function()
+		inst[prop] = val
+	end)
+end
+
+local function applyProps(inst, props, skipKeys)
+	skipKeys = skipKeys or {}
+	for key, rawVal in pairs(props) do
+		if not skipKeys[key] then
+			if type(rawVal) == "table" and rawVal._ref ~= nil then
+			else
+				trySet(inst, key, rawVal)
+			end
+		end
+	end
+end
+
+local function createInstance(class)
+	local ok, inst = pcall(Instance.new, class)
+	if not ok then
+		warn(string.format("[ModelBuilder] Cannot create instance of class '%s': %s", class, tostring(inst)))
+		return nil
+	end
+	return inst
+end
+
+local DeferredQueue = {}
+
+local function queueDeferred(fn)
+	table.insert(DeferredQueue, fn)
+end
+
+local function flushDeferred()
+	for _, fn in ipairs(DeferredQueue) do
+		local ok, err = pcall(fn)
+		if not ok then
+			warn("[ModelBuilder] Deferred ref resolution error: " .. tostring(err))
+		end
+	end
+	DeferredQueue = {}
+end
+
+
+local WELD_CLASSES = {
+	Weld = true, WeldConstraint = true, Motor6D = true,
+}
+
+local CONSTRAINT_CLASSES = {
+	HingeConstraint = true, BallSocketConstraint = true, SpringConstraint = true,
+	RopeConstraint = true, RodConstraint = true, CylindricalConstraint = true,
+	TorsionSpringConstraint = true, UniversalConstraint = true, LineForce = true,
+	PlaneConstraint = true, NoCollisionConstraint = true,
+}
+
+local function buildNode(node, parent, root)
+	local class = node.class
+	local props = node.props or {}
+
+	local inst = createInstance(class)
+	if inst == nil then return nil end
+
+	inst.Name = node.name
+
+	inst.Parent = parent
+
+	if inst:IsA("BasePart") then
+		applyProps(inst, props)
+
+	elseif WELD_CLASSES[class] then
+		applyProps(inst, props, { Part0 = true, Part1 = true })
+		queueDeferred(function()
+			if props.Part0 and props.Part0._ref ~= nil then
+				local p0 = resolvePath(root, props.Part0._ref)
+				if p0 then pcall(function() inst.Part0 = p0 end) end
+			end
+			if props.Part1 and props.Part1._ref ~= nil then
+				local p1 = resolvePath(root, props.Part1._ref)
+				if p1 then pcall(function() inst.Part1 = p1 end) end
+			end
+		end)
+
+	elseif CONSTRAINT_CLASSES[class] then
+		applyProps(inst, props, { Attachment0 = true, Attachment1 = true })
+		queueDeferred(function()
+			if props.Attachment0 and props.Attachment0._ref ~= nil then
+				local a0 = resolvePath(root, props.Attachment0._ref)
+				if a0 then pcall(function() inst.Attachment0 = a0 end) end
+			end
+			if props.Attachment1 and props.Attachment1._ref ~= nil then
+				local a1 = resolvePath(root, props.Attachment1._ref)
+				if a1 then pcall(function() inst.Attachment1 = a1 end) end
+			end
+		end)
+
+	elseif class == "Model" then
+		if node._hasPrimary and props.PrimaryPart then
+			queueDeferred(function()
+				local pp = resolvePath(root, props.PrimaryPart._ref)
+				if pp then pcall(function() inst.PrimaryPart = pp end) end
+			end)
+		end
+
+	else
+		applyProps(inst, props)
+	end
+
+	for _, childNode in ipairs(node.children or {}) do
+		buildNode(childNode, inst, root)
+	end
+
+	return inst
+end
+
+
+local function buildMaterials(materials)
+	if not materials then return end
+	for _, mat in ipairs(materials) do
+		local existing = MaterialService:FindFirstChild(mat.name)
+		if existing and existing:IsA("MaterialVariant") then
+			existing:Destroy()
+		end
+
+		local variant = Instance.new("MaterialVariant")
+		variant.Name = mat.name
+		pcall(function()
+			variant.BaseMaterial = Enum.Material[mat.baseMaterial]
+		end)
+		pcall(function() variant.ColorMap     = mat.colorMap     end)
+		pcall(function() variant.MetalnessMap = mat.metalnessMap end)
+		pcall(function() variant.NormalMap    = mat.normalMap    end)
+		pcall(function() variant.RoughnessMap = mat.roughnessMap end)
+		variant.Parent = MaterialService
+	end
+end
+
+
+local Builder = {}
+
+function Builder.Build(encoded, parent)
+	parent = parent or workspace
+	assert(type(encoded) == "string", "[ModelBuilder] Build() expects a string.")
+
+	local ok, payload = pcall(HttpService.JSONDecode, HttpService, encoded)
+	if not ok then
+		error("[ModelBuilder] JSON decoding failed: " .. tostring(payload))
+	end
+
+	if payload.version ~= 2 then
+		warn(string.format(
+			"[ModelBuilder] Payload version mismatch (got %s, expected 2). Proceeding anyway.",
+			tostring(payload.version)))
+	end
+
+	DeferredQueue = {}
+
+	buildMaterials(payload.materials)
+
+	local modelNode = payload.model
+	if modelNode == nil then
+		error("[ModelBuilder] Payload contains no model data.")
+	end
+
+	local root = createInstance(modelNode.class)
+	if root == nil then return nil end
+
+	root.Name   = modelNode.name
+	root.Parent = parent
+
+
+	if modelNode.class == "Model" and modelNode._hasPrimary then
+		local pp = modelNode.props and modelNode.props.PrimaryPart
+		if pp then
+			queueDeferred(function()
+				local inst = resolvePath(root, pp._ref)
+				if inst then pcall(function() root.PrimaryPart = inst end) end
+			end)
+		end
+	end
+
+	for _, childNode in ipairs(modelNode.children or {}) do
+		buildNode(childNode, root, root)
+	end
+
+	flushDeferred()
+	return root
+end
+
+function Builder.Inspect(encoded)
+	local ok, payload = pcall(HttpService.JSONDecode, HttpService, encoded)
+	if not ok then
+		error("[ModelBuilder] JSON decoding failed: " .. tostring(payload))
+	end
+	return payload
+end
+
+return Builder
