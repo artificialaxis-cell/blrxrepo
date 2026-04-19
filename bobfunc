@@ -1,6 +1,6 @@
 local bobbing = false
 
-function BOB()
+return function()
 	if bobbing then return end
 	bobbing = true
 
@@ -552,5 +552,3 @@ function BOB()
 		end
 	end)
 end
-
-return BOB
