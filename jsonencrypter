@@ -1,0 +1,237 @@
+local HttpService     = game:GetService("HttpService")
+local MaterialService = game:GetService("MaterialService")
+
+local function sV3(v)   return { v.X, v.Y, v.Z } end
+local function sC3(c)   return { c.R, c.G, c.B } end
+local function sCF(cf)  return { cf:GetComponents() } end
+local function sV2(v)   return { v.X, v.Y } end
+
+local function tag(t, v) return { _t = t, v = v } end
+
+local function encodeValue(val)
+	local vt = typeof(val)
+	if vt == "number"   then return val
+	elseif vt == "boolean" then return val
+	elseif vt == "string"  then return val
+	elseif vt == "Vector3"  then return tag("v3", sV3(val))
+	elseif vt == "Color3"   then return tag("c3", sC3(val))
+	elseif vt == "CFrame"   then return tag("cf", sCF(val))
+	elseif vt == "Vector2"  then return tag("v2", sV2(val))
+	elseif vt == "EnumItem" then return tag("en", { cat = tostring(val.EnumType), val = val.Name })
+	end
+	return nil 
+end
+
+local function getPath(inst, root)
+	if inst == nil then return nil end
+	if inst == root then return "" end
+	local parts = {}
+	local cur   = inst
+	while cur ~= nil and cur ~= root do
+		table.insert(parts, 1, cur.Name)
+		cur = cur.Parent
+	end
+	if cur == nil then return nil end  -- not under root
+	return table.concat(parts, "/")
+end
+
+local BASE_PART_PROPS = {
+	"Anchored", "CanCollide", "CanQuery", "CanTouch",
+	"CastShadow", "Locked", "Massless",
+	"Transparency", "Reflectance",
+	"Color", "Material", "MaterialVariant",
+	"TopSurface", "BottomSurface",
+	"CFrame", "Size",
+}
+
+local CLASS_EXTRA_PROPS = {
+	Part             = { "Shape" },
+	TrussPart        = { "Style" },
+	SpecialMesh      = { "MeshType", "MeshId", "TextureId", "Scale", "Offset", "VertexColor" },
+	Texture          = { "Texture", "Face", "Transparency", "Color3",
+		"StudsPerTileU", "StudsPerTileV", "OffsetStudsU", "OffsetStudsV" },
+	Decal            = { "Texture", "Face", "Transparency", "Color3", "ZIndex" },
+	SurfaceAppearance= { "AlphaMode", "ColorMap", "MetalnessMap", "NormalMap", "RoughnessMap" },
+	Attachment       = { "CFrame" },
+	PointLight       = { "Brightness", "Color", "Enabled", "Range", "Shadows" },
+	SpotLight        = { "Brightness", "Color", "Enabled", "Range", "Shadows", "Angle", "Face" },
+	SurfaceLight     = { "Brightness", "Color", "Enabled", "Range", "Shadows", "Angle", "Face" },
+}
+
+local WELD_CLASSES = {
+	Weld         = { refs = { "Part0", "Part1" }, cframes = { "C0", "C1" } },
+	WeldConstraint = { refs = { "Part0", "Part1" } },
+	Motor6D      = { refs = { "Part0", "Part1" }, cframes = { "C0", "C1" },
+		extra = { "CurrentAngle" } },
+}
+
+local CONSTRAINT_VALUE_PROPS = {
+	HingeConstraint        = { "LimitsEnabled", "LowerAngle", "UpperAngle",
+		"ActuatorType", "AngularVelocity", "MotorMaxAcceleration",
+		"MotorMaxTorque", "Restitution", "ServoMaxTorque", "TargetAngle" },
+	BallSocketConstraint   = { "LimitsEnabled", "MaxFrictionTorque", "Restitution",
+		"TwistLimitsEnabled", "TwistLowerAngle", "TwistUpperAngle",
+		"UpperAngle" },
+	SpringConstraint       = { "Coils", "Damping", "FreeLength", "LimitsEnabled",
+		"MaxLength", "MinLength", "Radius", "Stiffness", "Visible" },
+	RopeConstraint         = { "Length", "Restitution", "Visible", "WinchEnabled",
+		"WinchForce", "WinchResponsiveness", "WinchSpeed", "WinchTarget" },
+	RodConstraint          = { "Length", "LimitsEnabled", "LowerAngle", "UpperAngle",
+		"Restitution", "Visible" },
+	CylindricalConstraint  = { "AngularActuatorType", "AngularLimitsEnabled", "AngularRestitution",
+		"AngularSpeed", "AngularVelocity", "InclinationAngle",
+		"LimitsEnabled", "LinearActuatorType", "LinearRestitution",
+		"LinearSpeed", "LinearVelocity", "LowerAngle", "LowerLimit",
+		"MotorMaxAngularAcceleration", "MotorMaxForce", "MotorMaxTorque",
+		"Restitution", "ServoMaxForce", "ServoMaxTorque",
+		"TargetAngle", "TargetPosition", "UpperAngle", "UpperLimit", "Visible" },
+	TorsionSpringConstraint= { "Coils", "Damping", "LimitsEnabled", "LowerAngle",
+		"MaxTorque", "Restitution", "Stiffness", "UpperAngle", "Visible" },
+	UniversalConstraint    = { "LimitsEnabled", "MaxAngle", "Restitution", "Visible" },
+	LineForce              = { "ApplyAtCenterOfMass", "InverseSquareLaw",
+		"Magnitude", "MaxForce", "Restitution", "Visible" },
+	PlaneConstraint        = { "Visible" },
+	NoCollisionConstraint  = {},
+}
+
+local SKIP_CLASSES = {
+	Script = true, LocalScript = true, ModuleScript = true,
+	RemoteEvent = true, RemoteFunction = true,
+	BindableEvent = true, BindableFunction = true,
+	Animator = true,MeshPart = true
+}
+
+
+local function readProps(inst, propNames)
+	local out = {}
+	for _, name in ipairs(propNames) do
+		local ok, val = pcall(function() return inst[name] end)
+		if ok and val ~= nil then
+			local encoded = encodeValue(val)
+			if encoded ~= nil then
+				out[name] = encoded
+			end
+		end
+	end
+	return out
+end
+
+local function serializeInstance(inst, root)
+	local class = inst.ClassName
+
+	if SKIP_CLASSES[class] then return nil end
+
+	if class == "UnionOperation" then
+		warn(string.format(
+			"[ModelEncrypter] UnionOperation '%s' will be serialized as a plain Part (unions cannot be rebuilt).",
+			inst:GetFullName()))
+	end
+
+	local node = {
+		class    = class,
+		name     = inst.Name,
+		props    = {},
+		children = {},
+	}
+
+	if inst:IsA("BasePart") then
+		node.props = readProps(inst, BASE_PART_PROPS)
+		local extra = CLASS_EXTRA_PROPS[class]
+		if extra then
+			local extraProps = readProps(inst, extra)
+			for k, v in pairs(extraProps) do
+				node.props[k] = v
+			end
+		end
+
+	elseif CLASS_EXTRA_PROPS[class] then
+		node.props = readProps(inst, CLASS_EXTRA_PROPS[class])
+
+	elseif class == "Attachment" then
+		node.props = readProps(inst, CLASS_EXTRA_PROPS.Attachment)
+
+	elseif WELD_CLASSES[class] then
+		local wInfo = WELD_CLASSES[class]
+		for _, refName in ipairs(wInfo.refs or {}) do
+			local ok, refInst = pcall(function() return inst[refName] end)
+			if ok and refInst then
+				node.props[refName] = { _ref = getPath(refInst, root) }
+			end
+		end
+		for _, cfName in ipairs(wInfo.cframes or {}) do
+			local ok, cf = pcall(function() return inst[cfName] end)
+			if ok then node.props[cfName] = tag("cf", sCF(cf)) end
+		end
+		for _, extraName in ipairs(wInfo.extra or {}) do
+			local ok, v = pcall(function() return inst[extraName] end)
+			if ok then node.props[extraName] = encodeValue(v) end
+		end
+		node._deferred = true
+
+	elseif CONSTRAINT_VALUE_PROPS[class] then
+		local att0ok, att0 = pcall(function() return inst.Attachment0 end)
+		local att1ok, att1 = pcall(function() return inst.Attachment1 end)
+		if att0ok and att0 then node.props.Attachment0 = { _ref = getPath(att0, root) } end
+		if att1ok and att1 then node.props.Attachment1 = { _ref = getPath(att1, root) } end
+		for _, propName in ipairs(CONSTRAINT_VALUE_PROPS[class]) do
+			local ok, v = pcall(function() return inst[propName] end)
+			if ok and v ~= nil then
+				local encoded = encodeValue(v)
+				if encoded ~= nil then
+					node.props[propName] = encoded
+				end
+			end
+		end
+		node._deferred = true
+
+	elseif class == "Model" then
+		if inst.PrimaryPart then
+			node.props.PrimaryPart = { _ref = getPath(inst.PrimaryPart, root) }
+			node._hasPrimary = true
+		end
+	end
+
+	for _, child in ipairs(inst:GetChildren()) do
+		local childNode = serializeInstance(child, root)
+		if childNode then
+			table.insert(node.children, childNode)
+		end
+	end
+
+	return node
+end
+
+local function serializeMaterials()
+	local list = {}
+	for _, child in ipairs(MaterialService:GetChildren()) do
+		if child:IsA("MaterialVariant") then
+			table.insert(list, {
+				name         = child.Name,
+				baseMaterial = child.BaseMaterial.Name,
+				colorMap     = child.ColorMap,
+				metalnessMap = child.MetalnessMap,
+				normalMap    = child.NormalMap,
+				roughnessMap = child.RoughnessMap,
+			})
+		end
+	end
+	return list
+end
+
+
+local Encrypter = {}
+function Encrypter.Encrypt(model)
+	assert(typeof(model) == "Instance", "[ModelEncrypter] Encrypt() expects an Instance.")
+	local payload = {
+		version   = 2,
+		materials = serializeMaterials(),
+		model     = serializeInstance(model, model),
+	}
+	local result = HttpService:JSONEncode(payload)
+	if not result then
+		error("[ModelEncrypter] JSON encoding failed: " .. tostring(result))
+	end
+	return result
+end
+
+return Encrypter
