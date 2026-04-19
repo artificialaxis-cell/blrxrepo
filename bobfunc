@@ -552,3 +552,5 @@ function BOB()
 		end
 	end)
 end
+
+return BOB
