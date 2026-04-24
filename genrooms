@@ -1,0 +1,319 @@
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+local CONFIG = {
+	SEED = 42,
+	CHUNK_SIZE = 64,
+	GRID_STEP = 16,
+	WALL_HEIGHT = 18,
+	WALL_THICKNESS = 1.7,
+	RENDER_DISTANCE = 8,
+	UPDATE_INTERVAL = 0.25,
+}
+
+local WallTemplate
+local FGP
+local loadedChunks = {}
+local lastChunkX = math.huge
+local lastChunkZ = math.huge
+local tickTimer = 0
+
+local function noise(x, z, freq, octaveId)
+	local ox = CONFIG.SEED * 137.3 + octaveId * 91.7
+	local oz = CONFIG.SEED * 53.1 + octaveId * 47.3
+	return math.noise((x + ox) * freq, (z + oz) * freq)
+end
+
+local function layeredNoise(x, z, freq1, freq2, freq3)
+	local a = noise(x, z, freq1, 1) * 0.60
+	local b = noise(x, z, freq2, 2) * 0.30
+	local c = noise(x, z, freq3, 3) * 0.10
+	return (a + b + c) * 0.5 + 0.5
+end
+
+local function hash(ix, iz, salt)
+	local v = bit32.bxor(ix * 73856093, iz * 19349663, salt * 83492791)
+	v = bit32.bxor(bit32.rshift(v, 13), v) * 1540483477
+	v = bit32.bxor(bit32.rshift(v, 15), v)
+	return (v % 1000) / 1000.0
+end
+
+local ZONE = {
+	OPEN = 1,
+	ROOM = 2,
+	CORRIDOR = 3,
+	VOID = 4,
+}
+
+local function placeCorner(parent, gx, gz)
+	local part = WallTemplate:Clone()
+	part.Anchored = true
+	part.Size = Vector3.new(CONFIG.WALL_THICKNESS, CONFIG.WALL_HEIGHT, CONFIG.WALL_THICKNESS)
+	part.CFrame = CFrame.new(gx, FGP + CONFIG.WALL_HEIGHT * 0.5, gz)
+	part.Parent = parent
+end
+
+local function classifyZone(wx, wz)
+	local SAFE_RADIUS = 48
+	if math.sqrt(wx * wx + wz * wz) < SAFE_RADIUS then
+		return ZONE.OPEN
+	end
+
+	local macro = layeredNoise(wx, wz, 0.008, 0.020, 0.060)
+	local meso = layeredNoise(wx, wz, 0.030, 0.070, 0.140)
+
+	if macro > 0.22 then
+		return ZONE.OPEN
+	elseif macro > 0.75 then
+		if meso > 0.50 then
+			return ZONE.ROOM
+		else
+			return ZONE.CORRIDOR
+		end
+	else
+		return ZONE.VOID
+	end
+end
+
+local function isSolid(zone)
+	return zone == ZONE.VOID
+end
+
+local function shouldPlaceWall(wx, wz, axis)
+	local zoneHere = classifyZone(wx, wz)
+
+	local nx = axis == "X" and (wx + CONFIG.GRID_STEP) or wx
+	local nz = axis == "Z" and (wz + CONFIG.GRID_STEP) or wz
+	local zoneNext = classifyZone(nx, nz)
+
+	local hereSolid = isSolid(zoneHere)
+	local nextSolid = isSolid(zoneNext)
+
+	if hereSolid ~= nextSolid then
+		local doorChance = 0.22
+		local dh = hash(math.floor(wx / CONFIG.GRID_STEP), math.floor(wz / CONFIG.GRID_STEP), 7)
+		if dh < doorChance then
+			return false
+		end
+		return true
+	end
+
+	if hereSolid and nextSolid then
+		local DOOR_INTERVAL = 15
+		local wallPos = axis == "X" and wz or wx
+		if (math.floor(wallPos / DOOR_INTERVAL) % 2 == 0) and
+			(math.floor(wallPos % DOOR_INTERVAL) < CONFIG.GRID_STEP * 2) then
+			return false
+		end
+
+		local dh = hash(math.floor(wx / CONFIG.GRID_STEP), math.floor(wz / CONFIG.GRID_STEP), 7)
+		if dh < 0.22 then 
+			return false 
+		end
+		return true
+	end
+
+	if zoneHere == ZONE.ROOM then
+		local detail = noise(wx, wz, 0.12, 5)
+		local threshold = 0.4
+		if math.abs(detail) > threshold then
+			local dh2 = hash(math.floor(wx / CONFIG.GRID_STEP), math.floor(wz / CONFIG.GRID_STEP), 13)
+			if dh2 < 0.30 then 
+				return false 
+			end
+			return true
+		end
+	end
+
+	if zoneHere == ZONE.CORRIDOR then
+		local pinch = noise(wx, wz, 0.18, 6)
+		if pinch > 0.40 then
+			return true
+		end
+	end
+
+	if zoneHere == ZONE.OPEN then
+		local scatter = noise(wx, wz, 0.07, 8)
+		local scatter2 = noise(wx, wz, 0.15, 9)
+		if scatter > 0.20 or scatter2 > 0.30 then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function placeWall(parent, wx, wz, axis)
+	local part = WallTemplate:Clone()
+	part.Anchored = true
+
+	local halfStep = CONFIG.GRID_STEP * 0.5
+	local halfH = CONFIG.WALL_HEIGHT * 0.5
+
+	local posX, posZ, sizeX, sizeZ
+
+	if axis == "X" then
+		posX = wx + CONFIG.GRID_STEP
+		posZ = wz + halfStep
+		sizeX = CONFIG.WALL_THICKNESS
+		sizeZ = CONFIG.GRID_STEP
+	else
+		posX = wx + halfStep
+		posZ = wz + CONFIG.GRID_STEP
+		sizeX = CONFIG.GRID_STEP
+		sizeZ = CONFIG.WALL_THICKNESS
+	end
+
+	part.Size = Vector3.new(sizeX, CONFIG.WALL_HEIGHT, sizeZ)
+	part.CFrame = CFrame.new(posX, FGP + halfH, posZ)
+	part.Parent = parent
+end
+
+local Camera = workspace.CurrentCamera
+local CAMERA_SAFE_DISTANCE = 2
+
+local function isChunkInView(ncx, ncz, playerChunkX, playerChunkZ)
+	local dx = math.abs(ncx - playerChunkX)
+	local dz = math.abs(ncz - playerChunkZ)
+
+	if dx <= CAMERA_SAFE_DISTANCE and dz <= CAMERA_SAFE_DISTANCE then
+		return true
+	end
+
+	local wx = ncx * CONFIG.CHUNK_SIZE + CONFIG.CHUNK_SIZE * 0.5
+	local wz = ncz * CONFIG.CHUNK_SIZE + CONFIG.CHUNK_SIZE * 0.5
+	local worldPos = Vector3.new(wx, Camera.CFrame.Position.Y, wz)
+
+	local _, inView = Camera:WorldToViewportPoint(worldPos)
+	return inView
+end
+
+local function generateChunk(chunkX, chunkZ)
+	local key = chunkX .. "," .. chunkZ
+	if loadedChunks[key] then return end
+
+	local originX = chunkX * CONFIG.CHUNK_SIZE
+	local originZ = chunkZ * CONFIG.CHUNK_SIZE
+
+	local folder = Instance.new("Folder")
+	folder.Name = "Chunk_" .. key
+
+	for cx = 0, CONFIG.CHUNK_SIZE - CONFIG.GRID_STEP, CONFIG.GRID_STEP do
+		for cz = 0, CONFIG.CHUNK_SIZE - CONFIG.GRID_STEP, CONFIG.GRID_STEP do
+			local wx = originX + cx
+			local wz = originZ + cz
+
+			if shouldPlaceWall(wx, wz, "X") then
+				placeWall(folder, wx, wz, "X")
+			end
+			if shouldPlaceWall(wx, wz, "Z") then
+				placeWall(folder, wx, wz, "Z")
+			end
+		end
+	end
+
+	for cx = 0, CONFIG.CHUNK_SIZE, CONFIG.GRID_STEP do
+		for cz = 0, CONFIG.CHUNK_SIZE, CONFIG.GRID_STEP do
+			local gx = originX + cx
+			local gz = originZ + cz
+
+			local hasWall = 
+				shouldPlaceWall(gx - CONFIG.GRID_STEP, gz - CONFIG.GRID_STEP, "X") or
+				shouldPlaceWall(gx - CONFIG.GRID_STEP, gz, "X") or
+				shouldPlaceWall(gx - CONFIG.GRID_STEP, gz - CONFIG.GRID_STEP, "Z") or
+				shouldPlaceWall(gx, gz - CONFIG.GRID_STEP, "Z")
+
+			if hasWall then
+				placeCorner(folder, gx, gz)
+			end
+		end
+	end
+
+	folder.Parent = workspace
+	loadedChunks[key] = folder
+end
+
+local function unloadChunk(key)
+	if loadedChunks[key] then
+		loadedChunks[key]:Destroy()
+		loadedChunks[key] = nil
+	end
+end
+
+local function worldToChunk(pos)
+	return math.floor(pos.X / CONFIG.CHUNK_SIZE),
+		math.floor(pos.Z / CONFIG.CHUNK_SIZE)
+end
+
+local function updateChunks()
+	local player = Players.LocalPlayer
+	if not player then return end
+
+	local char = player.Character
+	if not char then return end
+
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+
+	local cx, cz = worldToChunk(root.Position)
+
+	if cx == lastChunkX and cz == lastChunkZ then 
+		return 
+	end
+
+	lastChunkX = cx
+	lastChunkZ = cz
+
+	local R = CONFIG.RENDER_DISTANCE
+	local needed = {}
+
+	for dx = -R, R do
+		for dz = -R, R do
+			local ncx, ncz = cx + dx, cz + dz
+			if isChunkInView(ncx, ncz, cx, cz) then
+				local key = ncx .. "," .. ncz
+				needed[key] = true
+			end
+		end
+	end
+
+	for key in pairs(loadedChunks) do
+		if not needed[key] then
+			unloadChunk(key)
+		end
+	end
+
+	for key in pairs(needed) do
+		local parts = string.split(key, ",")
+		generateChunk(tonumber(parts[1]), tonumber(parts[2]))
+	end
+end
+
+local BackroomsWallGen = {}
+
+function BackroomsWallGen.init(wallTemplate, floorGroundPos)
+	assert(typeof(wallTemplate) == "Instance" and wallTemplate:IsA("BasePart"),
+		"wallTemplate must be a BasePart")
+	assert(type(floorGroundPos) == "number",
+		"floorGroundPos must be a number")
+
+	WallTemplate = wallTemplate
+	FGP = floorGroundPos
+
+	updateChunks()
+
+	RunService.Heartbeat:Connect(function(dt)
+		tickTimer += dt
+		if tickTimer >= CONFIG.UPDATE_INTERVAL then
+			tickTimer = 0
+			updateChunks()
+		end
+	end)
+
+	print("[BackroomsWallGen] Initialized | Seed:", CONFIG.SEED,
+		"| Chunk:", CONFIG.CHUNK_SIZE, "| RD:", CONFIG.RENDER_DISTANCE)
+end
+
+BackroomsWallGen.CONFIG = CONFIG
+
+return BackroomsWallGen
