@@ -1,0 +1,116 @@
+local HttpService = game:GetService("HttpService")
+
+local function decodeValue(value)
+	if type(value) ~= "table" or not value.__t then
+		return value
+	end
+
+	local t = value.__t
+	if t == "CFrame" then
+		return CFrame.new(table.unpack(value.c))
+	elseif t == "Vector3" then
+		return Vector3.new(value.x, value.y, value.z)
+	elseif t == "Vector2" then
+		return Vector2.new(value.x, value.y)
+	elseif t == "Color3" then
+		return Color3.new(value.r, value.g, value.b)
+	elseif t == "UDim2" then
+		return UDim2.new(value.xs, value.xo, value.ys, value.yo)
+	elseif t == "UDim" then
+		return UDim.new(value.s, value.o)
+	elseif t == "Enum" then
+		local enumName = string.gsub(value.et, "Enum%.", "")
+		return Enum[enumName][value.n]
+	elseif t == "BrickColor" then
+		return BrickColor.new(value.num)
+	elseif t == "NumberRange" then
+		return NumberRange.new(value.min, value.max)
+	elseif t == "NumberSequence" then
+		local kp = {}
+		for i, k in ipairs(value.k) do
+			kp[i] = NumberSequenceKeypoint.new(k.t, k.v, k.e)
+		end
+		return NumberSequence.new(kp)
+	elseif t == "ColorSequence" then
+		local kp = {}
+		for i, k in ipairs(value.k) do
+			kp[i] = ColorSequenceKeypoint.new(k.t, Color3.new(k.c.r, k.c.g, k.c.b))
+		end
+		return ColorSequence.new(kp)
+	elseif t == "Rect" then
+		return Rect.new(value.minx, value.miny, value.maxx, value.maxy)
+	elseif t == "PhysicalProperties" then
+		return PhysicalProperties.new(value.d, value.f, value.e, value.fw, value.ew)
+	elseif t == "Font" then
+		local weightName = string.gsub(value.weight, "Enum%.FontWeight%.", "")
+		local styleName = string.gsub(value.style, "Enum%.FontStyle%.", "")
+		return Font.new(value.family, Enum.FontWeight[weightName], Enum.FontStyle[styleName])
+	else
+		return nil
+	end
+end
+
+local function findByPath(path)
+	local current = game
+	for part in string.gmatch(path, "[^%.]+") do
+		if not current then return nil end
+		current = current:FindFirstChild(part)
+	end
+	return current
+end
+
+local function buildInstance(data, parentInstance)
+	local ok, inst = pcall(function() return Instance.new(data.ClassName) end)
+	if not ok or not inst then
+		warn("Could not create " .. tostring(data.ClassName) .. " (" .. tostring(data.Name) .. ")")
+		return nil
+	end
+
+	inst.Name = data.Name
+
+	for name, value in pairs(data.Properties) do
+		if not (type(value) == "table" and value.__t == "Ref") then
+			local decoded = decodeValue(value)
+			pcall(function() inst[name] = decoded end)
+		end
+	end
+
+	if data.Attributes then
+		for name, value in pairs(data.Attributes) do
+			local decoded = decodeValue(value)
+			pcall(function() inst:SetAttribute(name, decoded) end)
+		end
+	end
+
+	inst.Parent = parentInstance
+
+	for _, childData in ipairs(data.Children) do
+		buildInstance(childData, inst)
+	end
+
+	return inst
+end
+
+local function resolveRefs(data, builtInstance)
+	for name, value in pairs(data.Properties) do
+		if type(value) == "table" and value.__t == "Ref" then
+			local target = findByPath(value.path)
+			if target then
+				pcall(function() builtInstance[name] = target end)
+			end
+		end
+	end
+
+	for i, childData in ipairs(data.Children) do
+		resolveRefs(childData, builtInstance:GetChildren()[i])
+	end
+end
+
+function rebuild(json)
+  local data = HttpService:JSONDecode(json)
+	local rebuilt = buildInstance(data, workspace)
+	if rebuilt then
+		resolveRefs(data, rebuilt)
+    return rebuilt
+	end
+end
