@@ -1,0 +1,1188 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+local CONFIG = {
+	EnterKey = Enum.KeyCode.E,
+	EnterGamepadKey = Enum.KeyCode.ButtonX,
+	ExitKey = Enum.KeyCode.F,
+	ThrottleKey = Enum.KeyCode.W,
+	BrakeKey = Enum.KeyCode.S,
+	ClutchKey = Enum.KeyCode.LeftShift,
+	SteerLeftKey = Enum.KeyCode.A,
+	SteerRightKey = Enum.KeyCode.D,
+	GearUpKey = Enum.KeyCode.E,
+	GearDownKey = Enum.KeyCode.Q,
+	CameraKey = Enum.KeyCode.C,
+	MouseSteerKey = Enum.KeyCode.M,
+
+	PromptActionText = "Drive",
+	PromptDistance = 12,
+
+	HiddenCFrame = CFrame.new(0, -450, 0),
+	HideAnchorDelay = 0.15,
+	EnterInputGuard = 0.25,
+	ExitSideClearance = 3,
+	ExitHeight = 2,
+	StartDelay = 0.5,
+}
+
+local CAMERA = {
+	mouseSensitivity = 0.3,
+	thumbstickSensitivity = 120,
+	minVerticalAngle = -35,
+	maxVerticalAngle = 80,
+	defaultVerticalAngle = 15,
+	minDistance = 4,
+	maxDistance = 20,
+	defaultDistance = 8,
+	zoomSpeed = 2,
+	distanceResponse = 8,
+
+	positionMass = 0.3,
+	positionDamping = 28,
+	positionStiffness = 40,
+
+	maxLateralLean = 12,
+	leanSpeed = 12,
+
+	horizontalResetSpeed = 3,
+	accelerationThreshold = 2,
+
+	fovRange = 27,
+	fovResponse = 4,
+	shakeVelocityThreshold = 60,
+}
+
+local WHEEL_SPEED_ATTRIBUTES = {
+	FR = "frontRws",
+	FL = "frontLws",
+	RR = "rearRws",
+	RL = "rearLws",
+}
+
+local REQUIRED_CHILDREN = {
+	"Wheels",
+	"Stats",
+	"Mass",
+	"Primary",
+	"Throttle",
+	"Brake",
+	"Clutch",
+	"Steer",
+}
+
+local REQUIRED_ATTRIBUTES = {
+	"psi",
+	"damper",
+	"tirestart",
+	"tireend",
+}
+
+local Spring = {}
+Spring.__index = Spring
+
+local function solveSpring(mass, damping, stiffness, offset, velocity, force)
+	local delta = damping * damping - 4 * stiffness / mass
+	local particular = force / stiffness
+
+	if delta > 0 then
+		local root = math.sqrt(delta)
+		local r1 = -0.5 * (damping + root)
+		local r2 = -0.5 * (damping - root)
+		local c1 = (r2 * offset - velocity) / (r2 - r1)
+		local c2 = (r1 * offset - velocity) / (r1 - r2)
+
+		return function(t)
+			return c1 * math.exp(r1 * t) + c2 * math.exp(r2 * t) + particular
+		end, function(t)
+			return c1 * r1 * math.exp(r1 * t) + c2 * r2 * math.exp(r2 * t)
+		end
+	end
+
+	if delta == 0 then
+		local r = -damping / 2
+		local c1 = offset
+		local c2 = velocity - r * offset
+
+		return function(t)
+			return math.exp(r * t) * (c1 + c2 * t) + particular
+		end, function(t)
+			return math.exp(r * t) * (c2 * r * t + c1 * r + c2)
+		end
+	end
+
+	local r = -damping / 2
+	local s = math.sqrt(-delta)
+	local c1 = offset
+	local c2 = (velocity - r * offset) / s
+
+	return function(t)
+		return math.exp(r * t) * (c1 * math.cos(s * t) + c2 * math.sin(s * t)) + particular
+	end, function(t)
+		return math.exp(r * t) * ((r * c1 + c2 * s) * math.cos(s * t) + (r * c2 - c1 * s) * math.sin(s * t))
+	end
+end
+
+function Spring.new(mass, damping, stiffness)
+	local self = setmetatable({
+		mass = mass,
+		damping = damping,
+		stiffness = stiffness,
+	}, Spring)
+
+	self:_restart(0, 0, 0)
+
+	return self
+end
+
+function Spring:_restart(offset, velocity, goal)
+	self.offsetAt, self.velocityAt = solveSpring(
+		self.mass,
+		self.damping,
+		self.stiffness,
+		offset - goal,
+		velocity,
+		goal * self.stiffness
+	)
+	self.startTime = os.clock()
+end
+
+function Spring:GetOffset()
+	return self.offsetAt(os.clock() - self.startTime)
+end
+
+function Spring:GetVelocity()
+	return self.velocityAt(os.clock() - self.startTime)
+end
+
+function Spring:SetGoal(goal)
+	self:_restart(self:GetOffset(), self:GetVelocity(), goal)
+end
+
+local function createCameraController(car)
+	local mass = car.Mass
+	local primary = car.Primary
+
+	local controller = {}
+
+	local camera
+	local enabled = false
+	local state = 1
+	local savedFov = 70
+
+	local orbitAngleH = 0
+	local orbitAngleV = CAMERA.defaultVerticalAngle
+	local orbitDistance = CAMERA.defaultDistance
+	local targetOrbitDistance = CAMERA.defaultDistance
+	local lateralLean = 0
+
+	local lastCarVelocity = Vector3.zero
+	local mouseDown = false
+	local lastMousePosition = Vector2.zero
+	local thumbstickInput = Vector2.zero
+
+	local springX, springY, springZ
+	local inputConnections = {}
+
+	local function resetSprings()
+		springX = Spring.new(CAMERA.positionMass, CAMERA.positionDamping, CAMERA.positionStiffness)
+		springY = Spring.new(CAMERA.positionMass, CAMERA.positionDamping, CAMERA.positionStiffness)
+		springZ = Spring.new(CAMERA.positionMass, CAMERA.positionDamping, CAMERA.positionStiffness)
+	end
+
+	local function calculateLateralLean(lateralVelocity, speed, dt)
+		local speedFactor = math.clamp(speed / 290, 0, 1)
+		local gForce = lateralVelocity * 0.5
+		local targetLean = math.clamp(
+			gForce * CAMERA.maxLateralLean * speedFactor,
+			-CAMERA.maxLateralLean,
+			CAMERA.maxLateralLean
+		)
+
+		lateralLean += (targetLean - lateralLean) * math.min(dt * CAMERA.leanSpeed, 1)
+
+		return lateralLean
+	end
+
+	function controller:Enable()
+		if enabled then
+			return
+		end
+		enabled = true
+
+		camera = workspace.CurrentCamera
+		savedFov = camera.FieldOfView
+		lastCarVelocity = mass.AssemblyLinearVelocity
+
+		orbitAngleH = 0
+		orbitAngleV = CAMERA.defaultVerticalAngle
+		orbitDistance = CAMERA.defaultDistance
+		targetOrbitDistance = CAMERA.defaultDistance
+		lateralLean = 0
+		mouseDown = false
+		thumbstickInput = Vector2.zero
+		resetSprings()
+
+		table.insert(inputConnections, UserInputService.InputBegan:Connect(function(input, processed)
+			if processed then
+				return
+			end
+
+			if input.UserInputType == Enum.UserInputType.MouseButton2 then
+				mouseDown = true
+				lastMousePosition = Vector2.new(input.Position.X, input.Position.Y)
+			end
+		end))
+
+		table.insert(inputConnections, UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton2 then
+				mouseDown = false
+			end
+		end))
+
+		table.insert(inputConnections, UserInputService.InputChanged:Connect(function(input, processed)
+			if processed then
+				return
+			end
+
+			if input.UserInputType == Enum.UserInputType.MouseMovement and mouseDown then
+				local position = Vector2.new(input.Position.X, input.Position.Y)
+				local delta = position - lastMousePosition
+				orbitAngleH -= delta.X * CAMERA.mouseSensitivity
+				orbitAngleV = math.clamp(
+					orbitAngleV + delta.Y * CAMERA.mouseSensitivity,
+					CAMERA.minVerticalAngle,
+					CAMERA.maxVerticalAngle
+				)
+				lastMousePosition = position
+			end
+
+			if input.UserInputType == Enum.UserInputType.Gamepad1 and input.KeyCode == Enum.KeyCode.Thumbstick2 then
+				thumbstickInput = Vector2.new(input.Position.X, input.Position.Y)
+			end
+
+			if input.UserInputType == Enum.UserInputType.MouseWheel then
+				targetOrbitDistance = math.clamp(
+					targetOrbitDistance - input.Position.Z * CAMERA.zoomSpeed,
+					CAMERA.minDistance,
+					CAMERA.maxDistance
+				)
+			end
+		end))
+
+		if state == 1 then
+			camera.CameraType = Enum.CameraType.Custom
+			camera.CameraSubject = primary
+		end
+	end
+
+	function controller:Disable(subject)
+		if not enabled then
+			return
+		end
+		enabled = false
+
+		for _, connection in inputConnections do
+			connection:Disconnect()
+		end
+		table.clear(inputConnections)
+
+		camera = workspace.CurrentCamera
+		if camera then
+			camera.CameraType = Enum.CameraType.Custom
+			camera.FieldOfView = savedFov
+			if subject then
+				camera.CameraSubject = subject
+			end
+		end
+	end
+
+	function controller:ChangeState()
+		state = if state == 1 then 2 else 1
+		resetSprings()
+	end
+
+	function controller:Update(dt)
+		if not enabled or not mass.Parent or not primary.Parent then
+			return
+		end
+
+		camera = workspace.CurrentCamera
+
+		if state == 1 then
+			camera.CameraType = Enum.CameraType.Custom
+			camera.CameraSubject = primary
+			camera.FieldOfView += (savedFov - camera.FieldOfView) * math.min(dt * CAMERA.fovResponse, 1)
+			lastCarVelocity = mass.AssemblyLinearVelocity
+			return
+		end
+
+		camera.CameraType = Enum.CameraType.Scriptable
+
+		local carVelocity = mass.AssemblyLinearVelocity
+		local carCFrame = mass.CFrame
+		local basePosition = primary.Position
+
+		local localVelocity = carCFrame:VectorToObjectSpace(carVelocity)
+		local speed = carVelocity.Magnitude * 0.28
+
+		local acceleration = (carVelocity - lastCarVelocity) / dt
+		local forwardAcceleration = carCFrame.LookVector:Dot(acceleration)
+		lastCarVelocity = carVelocity
+
+		if math.abs(forwardAcceleration) > CAMERA.accelerationThreshold then
+			orbitAngleH += (0 - orbitAngleH) * math.min(dt * CAMERA.horizontalResetSpeed, 1)
+		end
+
+		if thumbstickInput.Magnitude > 0.1 then
+			orbitAngleH -= thumbstickInput.X * CAMERA.thumbstickSensitivity * dt
+			orbitAngleV = math.clamp(
+				orbitAngleV - thumbstickInput.Y * CAMERA.thumbstickSensitivity * dt,
+				CAMERA.minVerticalAngle,
+				CAMERA.maxVerticalAngle
+			)
+		end
+
+		orbitDistance += (targetOrbitDistance - orbitDistance) * dt * CAMERA.distanceResponse
+
+		local carYaw = math.atan2(-carCFrame.LookVector.X, -carCFrame.LookVector.Z)
+		local horizontalRad = carYaw + math.rad(orbitAngleH)
+		local verticalRad = math.rad(orbitAngleV)
+
+		local offset = Vector3.new(
+			math.sin(horizontalRad) * math.cos(verticalRad) * orbitDistance,
+			math.sin(verticalRad) * orbitDistance,
+			math.cos(horizontalRad) * math.cos(verticalRad) * orbitDistance
+		)
+
+		local lean = calculateLateralLean(localVelocity.X, speed, dt)
+
+		springX:SetGoal(offset.X)
+		springY:SetGoal(offset.Y)
+		springZ:SetGoal(offset.Z)
+
+		local smoothedPosition = basePosition + Vector3.new(
+			springX:GetOffset(),
+			springY:GetOffset(),
+			springZ:GetOffset()
+		)
+
+		local lookAtPosition = basePosition
+		if carVelocity.Magnitude > 0.01 then
+			lookAtPosition += carVelocity.Unit * math.min(speed * 0.3, 5)
+		end
+
+		local lookDirection = (lookAtPosition - smoothedPosition).Unit
+		local upVector = Vector3.yAxis
+
+		local leanRad = math.rad(lean)
+		local right = lookDirection:Cross(upVector).Unit
+		upVector = (upVector * math.cos(leanRad) + right * math.sin(leanRad)).Unit
+
+		camera.CFrame = CFrame.lookAt(smoothedPosition, lookAtPosition, upVector)
+
+		local targetFov = math.clamp(savedFov + carVelocity.Magnitude / 5, savedFov, savedFov + CAMERA.fovRange)
+		camera.FieldOfView += (targetFov - camera.FieldOfView) * math.min(4 * dt, 1)
+
+		local shakeVelocity = carVelocity.Magnitude - CAMERA.shakeVelocityThreshold
+		if shakeVelocity > 0 then
+			local range = math.floor(shakeVelocity)
+			camera.CFrame *= CFrame.Angles(
+				math.rad(math.random(-range, range) / 1000),
+				math.rad(math.random(-range, range) / 1000),
+				math.rad(math.random(-range, range) / 1000)
+			)
+		end
+	end
+
+	return controller
+end
+
+local TireSimulation = {}
+
+local SAMPLE_RADII = { 0.1, 0.2, 0.3, 0.4 }
+local DIAGONAL = math.sqrt(0.5)
+local SAMPLE_OFFSETS = {}
+
+for _, radius in ipairs(SAMPLE_RADII) do
+	table.insert(SAMPLE_OFFSETS, { radius, 0 })
+	table.insert(SAMPLE_OFFSETS, { -radius, 0 })
+	table.insert(SAMPLE_OFFSETS, { 0, radius })
+	table.insert(SAMPLE_OFFSETS, { 0, -radius })
+end
+
+for _, radius in ipairs(SAMPLE_RADII) do
+	local diagonal = radius * DIAGONAL
+	table.insert(SAMPLE_OFFSETS, { diagonal, diagonal })
+	table.insert(SAMPLE_OFFSETS, { diagonal, -diagonal })
+	table.insert(SAMPLE_OFFSETS, { -diagonal, diagonal })
+	table.insert(SAMPLE_OFFSETS, { -diagonal, -diagonal })
+end
+
+local function getContactPoint(tire, origin, rayLength, raycastParams)
+	local cframe = tire.CFrame
+	local right = cframe.RightVector
+	local forward = cframe.LookVector
+	local direction = -cframe.UpVector * rayLength
+
+	local hitPoints = {}
+	local normals = {}
+	local materialCounts = {}
+	local hitCount = 0
+
+	local function cast(rayOrigin)
+		local result = workspace:Raycast(rayOrigin, direction, raycastParams)
+		if result then
+			hitCount += 1
+			hitPoints[hitCount] = result.Position
+			normals[hitCount] = result.Normal
+			materialCounts[result.Material] = (materialCounts[result.Material] or 0) + 1
+		end
+	end
+
+	cast(origin)
+	for _, offset in ipairs(SAMPLE_OFFSETS) do
+		cast(origin + right * offset[1] + forward * offset[2])
+	end
+
+	if hitCount == 0 then
+		return nil
+	end
+
+	local highestY = -math.huge
+	for i = 1, hitCount do
+		highestY = math.max(highestY, hitPoints[i].Y)
+	end
+
+	local positionSum = Vector3.zero
+	local normalSum = Vector3.zero
+	local keptCount = 0
+
+	for i = 1, hitCount do
+		if highestY - hitPoints[i].Y <= 0.05 then
+			positionSum += hitPoints[i]
+			normalSum += normals[i]
+			keptCount += 1
+		end
+	end
+
+	local averageNormal = if normalSum.Magnitude > 1e-6 then normalSum.Unit else Vector3.yAxis
+
+	local commonMaterial
+	local highestCount = 0
+	for material, count in pairs(materialCounts) do
+		if count > highestCount then
+			commonMaterial = material
+			highestCount = count
+		end
+	end
+
+	return positionSum / keptCount, averageNormal, commonMaterial
+end
+
+function TireSimulation.Update(car, wheel, raycastParams)
+	local springStrength = car:GetAttribute("psi") * 300
+	local damper = car:GetAttribute("damper")
+	local tireStart = car:GetAttribute("tirestart")
+	local tireEnd = car:GetAttribute("tireend")
+	local contactRadius = tireEnd + 0.35 - tireStart
+
+	local tire = wheel.Bounds
+	local up = tire.CFrame.UpVector
+
+	local startPosition = tire.Position - up * tireStart
+	tire.TIRESTART.WorldPosition = startPosition
+	tire.TIREEND.WorldPosition = tire.Position - up * tireEnd
+
+	local tireForce = tire.TireForce
+	local frictionForce = tire.FrictionForce
+
+	local contactPosition, groundNormal, groundMaterial = getContactPoint(tire, startPosition, contactRadius, raycastParams)
+
+	if not contactPosition then
+		tireForce.Force = Vector3.zero
+		frictionForce.Force = Vector3.zero
+		return nil
+	end
+
+	tire.ForceAtt.WorldPosition = contactPosition
+
+	local suspensionLength = startPosition.Y - contactPosition.Y
+	local compression = suspensionLength - contactRadius
+
+	local springForce = -springStrength * compression
+	local damperForce = -damper * tire.AssemblyLinearVelocity.Y
+
+	tireForce.Force = groundNormal * (springForce + damperForce)
+
+	return {
+		folder = wheel,
+		tire = tire,
+		CPos = contactPosition,
+		car = car,
+		grM = groundMaterial,
+	}
+end
+
+local FrictionSimulation = {}
+
+local MU_LOOKUP = {
+	[Enum.Material.Asphalt] = 1.9,
+	[Enum.Material.Concrete] = 1.7,
+	[Enum.Material.Pavement] = 1.1,
+	[Enum.Material.Grass] = 0.7,
+	[Enum.Material.Mud] = 0.25,
+	[Enum.Material.Sand] = 0.4,
+	[Enum.Material.Snow] = 0.2,
+	[Enum.Material.Ice] = 0.08,
+	[Enum.Material.Ground] = 1.0,
+	[Enum.Material.Rock] = 0.9,
+	[Enum.Material.Salt] = 0.7,
+	[Enum.Material.Basalt] = 0.95,
+	[Enum.Material.LeafyGrass] = 0.35,
+	[Enum.Material.CrackedLava] = 0.15,
+	[Enum.Material.Glacier] = 0.1,
+	[Enum.Material.Plastic] = 0.7,
+	[Enum.Material.SmoothPlastic] = 0.6,
+	[Enum.Material.Granite] = 0.95,
+	[Enum.Material.Slate] = 0.9,
+	[Enum.Material.Wood] = 0.6,
+	[Enum.Material.WoodPlanks] = 0.65,
+	[Enum.Material.CorrodedMetal] = 0.9,
+	[Enum.Material.DiamondPlate] = 1.0,
+	[Enum.Material.Metal] = 0.65,
+	[Enum.Material.Foil] = 0.15,
+	[Enum.Material.Marble] = 0.45,
+	[Enum.Material.Glass] = 0.05,
+	[Enum.Material.Pebble] = 0.5,
+	[Enum.Material.Fabric] = 0.7,
+	[Enum.Material.Neon] = 0.3,
+	[Enum.Material.ForceField] = 0.0,
+}
+
+local LONGITUDINAL = {
+	B = 10.0,
+	C = 1.65,
+	E = 0.97,
+	maxSlip = 1.0,
+}
+
+local LATERAL = {
+	B = 6.5,
+	C = 1.30,
+	E = 1.00,
+	maxSlip = math.rad(18),
+}
+
+local LOW_SPEED_REFERENCE = 2.5
+local STATIONARY_THRESHOLD = 0.75
+local STATIC_DAMPING = 220
+local SLIP_SMOKE_START = 0.35
+
+local function pacejkaNormalized(slip, params)
+	local clampedSlip = math.clamp(slip, -params.maxSlip, params.maxSlip)
+	local bx = params.B * clampedSlip
+
+	return math.sin(params.C * math.atan(bx - params.E * (bx - math.atan(bx))))
+end
+
+local function getSurfaceSpeed(tireInfo)
+	local car = tireInfo.car
+	local folder = tireInfo.folder
+
+	local axleSpeed
+	if folder.Name == "FR" or folder.Name == "FL" then
+		axleSpeed = car:GetAttribute("frontWS")
+	else
+		axleSpeed = car:GetAttribute("rearWS")
+	end
+
+	if typeof(axleSpeed) == "number" then
+		return axleSpeed
+	end
+
+	local tire = tireInfo.tire
+	local radius = tire:GetAttribute("Radius") or tire.Size.Y * 0.5
+	local wheelOmega = tire.AssemblyAngularVelocity:Dot(tire.CFrame.RightVector)
+
+	if math.abs(wheelOmega) > 1e-3 then
+		return wheelOmega * radius
+	end
+
+	return 0
+end
+
+function FrictionSimulation.Update(tireInfo)
+	local tire = tireInfo.tire
+	local car = tireInfo.car
+	local folder = tireInfo.folder
+	local contactPosition = tireInfo.CPos
+	local groundMaterial = tireInfo.grM
+
+	local forwardDir = tire.CFrame.LookVector
+	local rightDir = tire.CFrame.RightVector
+
+	local verticalLoad = (car.Mass.AssemblyMass * workspace.Gravity) / 4
+	local roadMu = MU_LOOKUP[groundMaterial] or 0.6
+	local surfaceSpeed = getSurfaceSpeed(tireInfo)
+
+	local contactOffset = contactPosition - tire.Position
+	local velocityAtContact = tire.AssemblyLinearVelocity + tire.AssemblyAngularVelocity:Cross(contactOffset)
+	local longitudinalVel = velocityAtContact:Dot(forwardDir)
+	local lateralVel = velocityAtContact:Dot(rightDir)
+
+	local referenceSpeed = math.max(math.abs(longitudinalVel), math.abs(surfaceSpeed), LOW_SPEED_REFERENCE)
+
+	local slipRatio = (surfaceSpeed - longitudinalVel) / referenceSpeed
+	local slipAngle = math.atan2(lateralVel, math.max(math.abs(longitudinalVel), LOW_SPEED_REFERENCE))
+
+	slipRatio = math.clamp(slipRatio, -LONGITUDINAL.maxSlip, LONGITUDINAL.maxSlip)
+	slipAngle = math.clamp(slipAngle, -LATERAL.maxSlip, LATERAL.maxSlip)
+
+	local isStationary = math.abs(longitudinalVel) < STATIONARY_THRESHOLD
+		and math.abs(surfaceSpeed) < STATIONARY_THRESHOLD
+		and math.abs(lateralVel) < STATIONARY_THRESHOLD
+
+	local FxMax = verticalLoad * roadMu
+	local FyMax = verticalLoad * roadMu
+
+	if FxMax <= 0 or FyMax <= 0 then
+		return
+	end
+
+	local frictionForce
+
+	if isStationary then
+		local driveSlip = math.clamp(surfaceSpeed / LOW_SPEED_REFERENCE, -1, 1)
+		local driveFx = pacejkaNormalized(driveSlip, LONGITUDINAL) * FxMax
+
+		local holdFx = -longitudinalVel * roadMu * STATIC_DAMPING
+		local holdFy = -lateralVel * roadMu * STATIC_DAMPING
+
+		frictionForce = forwardDir * (driveFx + holdFx) + rightDir * holdFy
+	else
+		local Fx = pacejkaNormalized(slipRatio, LONGITUDINAL) * FxMax
+		local Fy = pacejkaNormalized(slipAngle, LATERAL) * FyMax
+
+		local ellipse = math.sqrt((Fx / FxMax) ^ 2 + (Fy / FyMax) ^ 2)
+		if ellipse > 1 then
+			Fx /= ellipse
+			Fy /= ellipse
+		end
+
+		frictionForce = forwardDir * Fx - rightDir * Fy
+	end
+
+	tire.FrictionForce.Force = frictionForce
+
+	local normalizedSlipAngle = math.abs(slipAngle) / LATERAL.maxSlip
+	local totalSlip = math.sqrt(slipRatio * slipRatio + normalizedSlipAngle * normalizedSlipAngle)
+
+	local forceAttachment = tire:FindFirstChild("ForceAtt")
+	if forceAttachment then
+		local smoke = forceAttachment:FindFirstChild("TireSmoke")
+		local skid = forceAttachment:FindFirstChild("Skid")
+		local slipping = totalSlip > SLIP_SMOKE_START and tire.AssemblyLinearVelocity.Magnitude > 1.0
+
+		if smoke then
+			smoke.Rate = if slipping then 50 * math.min(totalSlip, 2) else 0
+		end
+
+		if skid then
+			skid.Volume = if slipping then 0.5 * totalSlip else 0
+			skid.PlaybackSpeed = if slipping then 0.85 + 0.4 * totalSlip else 0
+		end
+	end
+
+	car:SetAttribute(folder.Name .. "totalSlip", totalSlip)
+end
+
+local function resolveCar(car)
+	for _, name in ipairs(REQUIRED_CHILDREN) do
+		if not car:FindFirstChild(name) then
+			warn(string.format("UnifiedCarHandler: %s is missing '%s'", car:GetFullName(), name))
+			return nil
+		end
+	end
+
+	for _, name in ipairs(REQUIRED_ATTRIBUTES) do
+		if typeof(car:GetAttribute(name)) ~= "number" then
+			warn(string.format("UnifiedCarHandler: %s is missing numeric attribute '%s'", car:GetFullName(), name))
+			return nil
+		end
+	end
+
+	local mass = car.Mass
+	local primary = car.Primary
+
+	if not (mass:IsA("BasePart") and primary:IsA("BasePart") and car.Stats:IsA("ModuleScript")) then
+		warn(string.format("UnifiedCarHandler: %s has Mass, Primary or Stats of the wrong type", car:GetFullName()))
+		return nil
+	end
+
+	local success, stats = pcall(require, car.Stats)
+	if not success then
+		warn(string.format("UnifiedCarHandler: failed to load Stats for %s: %s", car:GetFullName(), tostring(stats)))
+		return nil
+	end
+
+	local driverMass = car:FindFirstChild("DriverMass")
+	if driverMass and not driverMass:IsA("BasePart") then
+		driverMass = nil
+	end
+
+	local drag = mass:FindFirstChild("Drag")
+	if drag and not drag:IsA("VectorForce") then
+		drag = nil
+	end
+
+	local steerSlide = primary:FindFirstChild("SteerSlide")
+	if steerSlide and not steerSlide:IsA("Attachment") then
+		steerSlide = nil
+	end
+
+	return {
+		wheels = car.Wheels,
+		stats = stats,
+		mass = mass,
+		primary = primary,
+		throttleValue = car.Throttle,
+		brakeValue = car.Brake,
+		clutchValue = car.Clutch,
+		steerValue = car.Steer,
+		driverMass = driverMass,
+		drag = drag,
+		steerSlide = steerSlide,
+	}
+end
+
+local function flatten(vector, fallback)
+	local flat = Vector3.new(vector.X, 0, vector.Z)
+	if flat.Magnitude < 0.01 then
+		return fallback
+	end
+
+	return flat.Unit
+end
+
+local function approach(current, target, speed, dt)
+	if current < target then
+		return math.min(current + speed * dt, target)
+	end
+
+	if current > target then
+		return math.max(current - speed * dt, target)
+	end
+
+	return current
+end
+
+local handledCars = setmetatable({}, { __mode = "k" })
+
+local UnifiedCarHandler = {}
+
+function UnifiedCarHandler:HandleCar(car)
+	if typeof(car) ~= "Instance" or not car:IsA("Model") then
+		warn("UnifiedCarHandler:HandleCar expects a car Model")
+		return
+	end
+
+	if handledCars[car] then
+		return
+	end
+
+	local player = Players.LocalPlayer
+	if not player then
+		warn("UnifiedCarHandler:HandleCar must be called from a client script")
+		return
+	end
+
+	local parts = resolveCar(car)
+	if not parts then
+		return
+	end
+
+	handledCars[car] = true
+
+	local wheels = parts.wheels
+	local stats = parts.stats
+	local mass = parts.mass
+	local primary = parts.primary
+	local throttleValue = parts.throttleValue
+	local brakeValue = parts.brakeValue
+	local clutchValue = parts.clutchValue
+	local steerValue = parts.steerValue
+	local driverMass = parts.driverMass
+	local drag = parts.drag
+	local steerSlide = parts.steerSlide
+
+	local cameraController = createCameraController(car)
+
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = { car }
+
+	local alive = true
+	local driving = false
+	local gear = 0
+	local mouseSteer = false
+	local enteredAt = 0
+	local entryCFrame = mass.CFrame
+
+	local character
+	local humanoid
+	local rootPart
+	local diedConnection
+
+	local connections = {}
+	local activeTweens = {}
+
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = "EnterCarPrompt"
+	prompt.ActionText = CONFIG.PromptActionText
+	prompt.ObjectText = car.Name
+	prompt.KeyboardKeyCode = CONFIG.EnterKey
+	prompt.GamepadKeyCode = CONFIG.EnterGamepadKey
+	prompt.HoldDuration = 0
+	prompt.MaxActivationDistance = CONFIG.PromptDistance
+	prompt.RequiresLineOfSight = false
+	prompt.Enabled = false
+	prompt.Parent = driverMass or mass
+
+	local function track(connection)
+		table.insert(connections, connection)
+		return connection
+	end
+
+	local function tweenValue(value, target, duration)
+		local previous = activeTweens[value]
+		if previous then
+			previous:Cancel()
+		end
+
+		local tween = TweenService:Create(value, TweenInfo.new(duration), { Value = target })
+		activeTweens[value] = tween
+		tween:Play()
+	end
+
+	local function releaseControls(parked)
+		for value, tween in activeTweens do
+			tween:Cancel()
+			activeTweens[value] = nil
+		end
+
+		throttleValue.Value = 0
+		clutchValue.Value = 0
+		brakeValue.Value = if parked then 1 else 0
+	end
+
+	local function computeExitCFrame()
+		if not (car:IsDescendantOf(workspace) and mass:IsDescendantOf(car)) then
+			return entryCFrame
+		end
+
+		local massCFrame = mass.CFrame
+
+		local side = -1
+		if driverMass then
+			side = if massCFrame:PointToObjectSpace(driverMass.Position).X < 0 then -1 else 1
+		end
+
+		local halfWidth = car:GetExtentsSize().X * 0.5
+		local rightVector = flatten(massCFrame.RightVector, Vector3.xAxis)
+		local lookVector = flatten(massCFrame.LookVector, -Vector3.zAxis)
+
+		local position = massCFrame.Position
+			+ rightVector * side * (halfWidth + CONFIG.ExitSideClearance)
+			+ Vector3.yAxis * CONFIG.ExitHeight
+
+		return CFrame.lookAt(position, position + lookVector)
+	end
+
+	local function leaveCar()
+		if not driving then
+			return
+		end
+		driving = false
+
+		local exitCFrame = computeExitCFrame()
+
+		releaseControls(true)
+
+		if diedConnection then
+			diedConnection:Disconnect()
+			diedConnection = nil
+		end
+
+		local subject = if humanoid and humanoid.Parent then humanoid else nil
+		cameraController:Disable(subject)
+
+		if rootPart and rootPart.Parent then
+			rootPart.Anchored = false
+			rootPart.AssemblyLinearVelocity = Vector3.zero
+			rootPart.AssemblyAngularVelocity = Vector3.zero
+			rootPart.CFrame = exitCFrame
+		end
+
+		character = nil
+		humanoid = nil
+		rootPart = nil
+
+		if alive and prompt.Parent then
+			prompt.Enabled = true
+		end
+	end
+
+	local function hideCharacter(root)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		root.CFrame = CONFIG.HiddenCFrame
+
+		task.delay(CONFIG.HideAnchorDelay, function()
+			if driving and rootPart == root and root.Parent then
+				root.Anchored = true
+			end
+		end)
+	end
+
+	local function enterCar()
+		if driving or not alive then
+			return
+		end
+
+		local currentCharacter = player.Character
+		local currentHumanoid = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
+		local currentRoot = currentCharacter and currentCharacter:FindFirstChild("HumanoidRootPart")
+
+		if not currentHumanoid or not currentRoot or currentHumanoid.Health <= 0 then
+			return
+		end
+
+		driving = true
+		enteredAt = os.clock()
+		character = currentCharacter
+		humanoid = currentHumanoid
+		rootPart = currentRoot
+		entryCFrame = currentRoot.CFrame
+
+		prompt.Enabled = false
+		releaseControls(false)
+
+		hideCharacter(currentRoot)
+		cameraController:Enable()
+
+		diedConnection = currentHumanoid.Died:Connect(leaveCar)
+	end
+
+	local function shiftGear(direction)
+		if clutchValue.Value <= 0.67 then
+			return
+		end
+
+		task.wait(stats.transmission.shift_time)
+
+		if not alive or not driving then
+			return
+		end
+
+		local newGear = gear + direction
+		if newGear > -2 and newGear < #stats.transmission.gears - 1 then
+			gear = newGear
+		end
+	end
+
+	local function isCarIntact()
+		return car:IsDescendantOf(workspace) and mass.Parent ~= nil and primary.Parent ~= nil
+	end
+
+	local function destroy()
+		if not alive then
+			return
+		end
+
+		if driving then
+			leaveCar()
+		end
+
+		alive = false
+
+		for _, connection in connections do
+			connection:Disconnect()
+		end
+		table.clear(connections)
+
+		for value, tween in activeTweens do
+			tween:Cancel()
+			activeTweens[value] = nil
+		end
+
+		cameraController:Disable(nil)
+
+		prompt:Destroy()
+		handledCars[car] = nil
+	end
+
+	local function step(dt)
+		if not isCarIntact() then
+			destroy()
+			return
+		end
+
+		if driving then
+			cameraController:Update(dt)
+		end
+
+		local frameScale = dt * 60
+
+		local steerTime = stats.steer_response_time_inactive
+		local targetSteer = 0
+		local mouseControlled = false
+
+		if driving and not UserInputService:GetFocusedTextBox() then
+			if mouseSteer then
+				local viewportWidth = math.max(workspace.CurrentCamera.ViewportSize.X, 1)
+				steerValue.Value = math.clamp((UserInputService:GetMouseLocation().X / viewportWidth) * 2 - 1, -1, 1)
+				mouseControlled = true
+			else
+				local left = UserInputService:IsKeyDown(CONFIG.SteerLeftKey)
+				local right = UserInputService:IsKeyDown(CONFIG.SteerRightKey)
+
+				if left ~= right then
+					targetSteer = if left then -1 else 1
+					steerTime = stats.steer_response_time_active
+				end
+			end
+		end
+
+		if not mouseControlled then
+			steerValue.Value = approach(steerValue.Value, targetSteer, steerTime, dt)
+		end
+
+		if steerSlide then
+			steerSlide.Position = Vector3.new(steerValue.Value * -0.31, -1.17, -7.216)
+		end
+
+		local velocity = mass.AssemblyLinearVelocity
+		local carSpeed = mass.CFrame:VectorToObjectSpace(velocity)
+		local carSpeedFront = carSpeed.Z
+
+		if drag then
+			local aero = stats.aero
+			local dragForce = Vector3.zero
+
+			if aero and velocity.Magnitude > 0.01 then
+				local magnitude = 7.5 * aero.rho * aero.Cd * aero.area * carSpeedFront * carSpeedFront
+				dragForce = -velocity.Unit * Vector3.new(1, 0.5, 1) * magnitude
+			end
+
+			drag.Force = dragForce
+		end
+
+		local throttle = throttleValue.Value
+		local brake = brakeValue.Value
+		local clutch = clutchValue.Value
+
+		local wheelSpeed = (((throttle * 50) * gear) * (1 - clutch))
+			+ -carSpeedFront * ((1 - throttle) * 1 - clutch) * (1 - brake)
+
+		for _, attribute in WHEEL_SPEED_ATTRIBUTES do
+			car:SetAttribute(attribute, wheelSpeed)
+		end
+		car:SetAttribute("rearWS", wheelSpeed)
+		car:SetAttribute("frontWS", wheelSpeed)
+
+		local tireEnd = car:GetAttribute("tireend")
+
+		for _, wheel in ipairs(wheels:GetChildren()) do
+			local speedAttribute = WHEEL_SPEED_ATTRIBUTES[wheel.Name]
+
+			if speedAttribute then
+				local tireInfo = TireSimulation.Update(car, wheel, raycastParams)
+				if tireInfo then
+					FrictionSimulation.Update(tireInfo)
+				end
+
+				local roll = wheel.Roll
+				roll.Value = (roll.Value + car:GetAttribute(speedAttribute) / tireEnd * frameScale) % 360
+
+				wheel.Bounds.SpinAtt.CFrame = CFrame.fromOrientation(math.rad(-roll.Value), 0, 0)
+			end
+		end
+	end
+
+	track(UserInputService.InputBegan:Connect(function(input, processed)
+		if processed or not driving then
+			return
+		end
+
+		local key = input.KeyCode
+
+		if key == CONFIG.ThrottleKey then
+			tweenValue(throttleValue, 1, stats.throttle_response_time)
+		elseif key == CONFIG.BrakeKey then
+			tweenValue(brakeValue, 1, stats.brake_response_time)
+		elseif key == CONFIG.ClutchKey then
+			tweenValue(clutchValue, 1, stats.clutch_response_time)
+		elseif key == CONFIG.GearUpKey then
+			if os.clock() - enteredAt > CONFIG.EnterInputGuard then
+				shiftGear(1)
+			end
+		elseif key == CONFIG.GearDownKey then
+			shiftGear(-1)
+		elseif key == CONFIG.CameraKey then
+			cameraController:ChangeState()
+		elseif key == CONFIG.MouseSteerKey then
+			mouseSteer = not mouseSteer
+		elseif key == CONFIG.ExitKey then
+			leaveCar()
+		end
+	end))
+
+	track(UserInputService.InputEnded:Connect(function(input)
+		if not driving then
+			return
+		end
+
+		local key = input.KeyCode
+
+		if key == CONFIG.ThrottleKey then
+			tweenValue(throttleValue, 0, stats.throttle_response_time / 2)
+		elseif key == CONFIG.BrakeKey then
+			tweenValue(brakeValue, 0, stats.brake_response_time / 2)
+		elseif key == CONFIG.ClutchKey then
+			tweenValue(clutchValue, 0, stats.clutch_response_time / 2)
+		end
+	end))
+
+	track(prompt.Triggered:Connect(enterCar))
+
+	track(player.CharacterRemoving:Connect(function()
+		if driving then
+			leaveCar()
+		end
+	end))
+
+	track(car.AncestryChanged:Connect(function()
+		if not car:IsDescendantOf(workspace) then
+			destroy()
+		end
+	end))
+
+	track(car.Destroying:Connect(destroy))
+
+	task.delay(CONFIG.StartDelay, function()
+		if not alive then
+			return
+		end
+
+		mass.Anchored = false
+		releaseControls(true)
+		prompt.Enabled = true
+
+		track(RunService.RenderStepped:Connect(step))
+	end)
+end
+
+return UnifiedCarHandler
