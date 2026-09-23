@@ -105,12 +105,15 @@ local function resolveRefs(data, builtInstance)
 		resolveRefs(childData, builtInstance:GetChildren()[i])
 	end
 end
+local Mdl = {}
 
-function rebuild(json)
-  local data = HttpService:JSONDecode(json)
+function Mdl.rebuild(json)
+	local data = HttpService:JSONDecode(json)
 	local rebuilt = buildInstance(data, workspace)
 	if rebuilt then
 		resolveRefs(data, rebuilt)
-    return rebuilt
+		return rebuilt
 	end
 end
+
+return Mdl
