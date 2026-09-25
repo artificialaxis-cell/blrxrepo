@@ -30,14 +30,14 @@ local CONFIG = {
 local STALL_FACTOR = 0.1
 
 local GEAR_ENVELOPE = {
-	[-1] = { MinSpeed = 0,  PeakSpeed = 15,  MaxSpeed = 58  },
+	[-1] = { PeakSpeed = 15,  MaxSpeed = 58  },
 
-	[1]  = { MinSpeed = 0,  PeakSpeed = 25,  MaxSpeed = 60  },
-	[2]  = { MinSpeed = 5,  PeakSpeed = 50, MaxSpeed = 124  },
-	[3]  = { MinSpeed = 7, PeakSpeed = 75, MaxSpeed = 165  },
-	[4]  = { MinSpeed = 12, PeakSpeed = 102, MaxSpeed = 195 },
-	[5]  = { MinSpeed = 15, PeakSpeed = 150, MaxSpeed = 220 },
-	[6]  = { MinSpeed = 20, PeakSpeed = 200, MaxSpeed = 252 },
+	[1]  = { PeakSpeed = 25,  MaxSpeed = 60  },
+	[2]  = { PeakSpeed = 50,  MaxSpeed = 124 },
+	[3]  = { PeakSpeed = 75,  MaxSpeed = 165 },
+	[4]  = { PeakSpeed = 102, MaxSpeed = 195 },
+	[5]  = { PeakSpeed = 150, MaxSpeed = 220 },
+	[6]  = { PeakSpeed = 200, MaxSpeed = 252 },
 }
 
 local SND_CFG = {
@@ -142,10 +142,8 @@ local function gearPower(gear, forwardSpeed)
 
 	local speed = math.abs(forwardSpeed)
 
-	if speed <= envelope.MinSpeed then
-		return STALL_FACTOR
-	elseif speed <= envelope.PeakSpeed then
-		local t = (speed - envelope.MinSpeed) / math.max(envelope.PeakSpeed - envelope.MinSpeed, 0.01)
+	if speed <= envelope.PeakSpeed then
+		local t = speed / math.max(envelope.PeakSpeed, 0.01)
 		return lerp(STALL_FACTOR, 1, t)
 	elseif speed <= envelope.MaxSpeed then
 		local t = (speed - envelope.PeakSpeed) / math.max(envelope.MaxSpeed - envelope.PeakSpeed, 0.01)
@@ -1352,6 +1350,69 @@ function UnifiedCarHandler:HandleCar(car)
 		end
 	end
 
+	local function destroy()
+		if not alive then
+			return
+		end
+
+		if driving then
+			leaveCar()
+		end
+
+		alive = false
+
+		stopSndNow()
+
+		for _, connection in connections do
+			connection:Disconnect()
+		end
+		table.clear(connections)
+
+		for value, tween in activeTweens do
+			tween:Cancel()
+			activeTweens[value] = nil
+		end
+
+		prompt:Destroy()
+		handledCars[car] = nil
+	end
+
+	local function onDriverDied()
+		if not driving then
+			return
+		end
+
+		if diedConnection then
+			diedConnection:Disconnect()
+			diedConnection = nil
+		end
+
+		driving = false
+		alive = false
+
+		stopSndNow()
+
+		for _, connection in connections do
+			connection:Disconnect()
+		end
+		table.clear(connections)
+
+		for value, tween in activeTweens do
+			tween:Cancel()
+			activeTweens[value] = nil
+		end
+
+		character = nil
+		humanoid = nil
+		rootPart = nil
+
+		handledCars[car] = nil
+
+		if car:IsDescendantOf(workspace) then
+			car:Destroy()
+		end
+	end
+
 	local function enterCar()
 		if driving or not alive then
 			return
@@ -1384,7 +1445,7 @@ function UnifiedCarHandler:HandleCar(car)
 		Hud.SetVisible(false)
 		startSnd()
 
-		diedConnection = currentHumanoid.Died:Connect(leaveCar)
+		diedConnection = currentHumanoid.Died:Connect(onDriverDied)
 	end
 
 	local function shiftGear(direction)
@@ -1406,33 +1467,6 @@ function UnifiedCarHandler:HandleCar(car)
 
 	local function isCarIntact()
 		return car:IsDescendantOf(workspace) and mass.Parent ~= nil and primary.Parent ~= nil
-	end
-
-	local function destroy()
-		if not alive then
-			return
-		end
-
-		if driving then
-			leaveCar()
-		end
-
-		alive = false
-
-		stopSndNow()
-
-		for _, connection in connections do
-			connection:Disconnect()
-		end
-		table.clear(connections)
-
-		for value, tween in activeTweens do
-			tween:Cancel()
-			activeTweens[value] = nil
-		end
-
-		prompt:Destroy()
-		handledCars[car] = nil
 	end
 
 	local function step(dt)
