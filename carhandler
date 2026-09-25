@@ -3,6 +3,7 @@ local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 
+
 local CONFIG = {
 	EnterKey = Enum.KeyCode.E,
 	EnterGamepadKey = Enum.KeyCode.ButtonX,
@@ -834,8 +835,12 @@ function UnifiedCarHandler:HandleCar(car)
 		local steerTime = stats.steer_response_time_inactive
 		local targetSteer = 0
 		local mouseControlled = false
-
 		if driving and not UserInputService:GetFocusedTextBox() then
+			local camera = workspace.CurrentCamera
+			if camera then
+				camera.CameraSubject = primary
+			end
+			
 			if mouseSteer then
 				local viewportWidth = math.max(workspace.CurrentCamera.ViewportSize.X, 1)
 				steerValue.Value = math.clamp((UserInputService:GetMouseLocation().X / viewportWidth) * 2 - 1, -1, 1)
