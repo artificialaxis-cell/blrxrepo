@@ -64,7 +64,6 @@ local WHEEL_SPEED_ATTRIBUTES = {
 
 local REQUIRED_CHILDREN = {
 	"Wheels",
-	"Stats",
 	"Mass",
 	"Primary",
 	"Throttle",
