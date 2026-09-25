@@ -794,7 +794,7 @@ function UnifiedCarHandler:HandleCar(car)
 		warn("UnifiedCarHandler:HandleCar must be called from a client script")
 		return
 	end
-
+	print("Resolving car")
 	local parts = resolveCar(car)
 	if not parts then
 		return
@@ -846,8 +846,8 @@ function UnifiedCarHandler:HandleCar(car)
 	prompt.RequiresLineOfSight = false
 	prompt.Enabled = false
 	prompt.Parent = driverMass or mass
-	
-	
+	print("resolved, going stats")
+
 	stat = {
 		throttle_response_time = 0.18,   -- turbo spooling but rally-tuned
 		brake_response_time = 0.35,      -- strong rally brakes, no full carbon race lag
