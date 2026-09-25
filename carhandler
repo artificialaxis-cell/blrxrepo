@@ -1518,7 +1518,15 @@ function UnifiedCarHandler:HandleCar(car)
 			local dragForce = Vector3.zero
 
 			if aero and velocity.Magnitude > 0.01 then
-				local magnitude = 7.5 * aero.rho * aero.Cd * aero.area * carSpeedFront * carSpeedFront
+				local speedMS = carSpeedFront * CONFIG.StudsToMeters
+
+				local magnitude =
+					0.5
+					* aero.rho
+					* aero.Cd
+					* aero.area
+					* speedMS
+					* speedMS				
 				dragForce = -velocity.Unit * Vector3.new(1, 0.5, 1) * magnitude
 			end
 
