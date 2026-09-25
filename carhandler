@@ -32,12 +32,12 @@ local STALL_FACTOR = 0.05
 local GEAR_ENVELOPE = {
 	[-1] = { MinSpeed = 0,  PeakSpeed = 5,  MaxSpeed = 28  },
 
-	[1]  = { MinSpeed = 0,  PeakSpeed = 8,  MaxSpeed = 38  },
-	[2]  = { MinSpeed = 5,  PeakSpeed = 20, MaxSpeed = 63  },
-	[3]  = { MinSpeed = 12, PeakSpeed = 35, MaxSpeed = 94  },
-	[4]  = { MinSpeed = 22, PeakSpeed = 54, MaxSpeed = 132 },
-	[5]  = { MinSpeed = 38, PeakSpeed = 78, MaxSpeed = 174 },
-	[6]  = { MinSpeed = 55, PeakSpeed = 105, MaxSpeed = 220 },
+	[1]  = { MinSpeed = 0,  PeakSpeed = 25,  MaxSpeed = 38  },
+	[2]  = { MinSpeed = 5,  PeakSpeed = 50, MaxSpeed = 63  },
+	[3]  = { MinSpeed = 12, PeakSpeed = 75, MaxSpeed = 94  },
+	[4]  = { MinSpeed = 22, PeakSpeed = 102, MaxSpeed = 132 },
+	[5]  = { MinSpeed = 38, PeakSpeed = 150, MaxSpeed = 174 },
+	[6]  = { MinSpeed = 55, PeakSpeed = 200, MaxSpeed = 220 },
 }
 
 local SND_CFG = {
@@ -1528,7 +1528,7 @@ function UnifiedCarHandler:HandleCar(car)
 		local powerFactor = gearPower(gear, carSpeedFront)
 		local driveInput = gearForce * throttle * (1 - clutch) * powerFactor
 
-		local wheelSpeed = (carSpeedFront + driveInput * 1.1) * (1 - brake)
+		local wheelSpeed = (carSpeedFront + driveInput * 1.25) * (1 - brake)
 
 		for _, attribute in WHEEL_SPEED_ATTRIBUTES do
 			car:SetAttribute(attribute, wheelSpeed)
