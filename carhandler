@@ -34,10 +34,10 @@ local GEAR_ENVELOPE = {
 
 	[1]  = { MinSpeed = 0,  PeakSpeed = 25,  MaxSpeed = 60  },
 	[2]  = { MinSpeed = 5,  PeakSpeed = 50, MaxSpeed = 124  },
-	[3]  = { MinSpeed = 12, PeakSpeed = 75, MaxSpeed = 165  },
-	[4]  = { MinSpeed = 22, PeakSpeed = 102, MaxSpeed = 195 },
-	[5]  = { MinSpeed = 38, PeakSpeed = 150, MaxSpeed = 220 },
-	[6]  = { MinSpeed = 55, PeakSpeed = 200, MaxSpeed = 252 },
+	[3]  = { MinSpeed = 7, PeakSpeed = 75, MaxSpeed = 165  },
+	[4]  = { MinSpeed = 12, PeakSpeed = 102, MaxSpeed = 195 },
+	[5]  = { MinSpeed = 15, PeakSpeed = 150, MaxSpeed = 220 },
+	[6]  = { MinSpeed = 20, PeakSpeed = 200, MaxSpeed = 252 },
 }
 
 local SND_CFG = {
