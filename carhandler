@@ -1381,7 +1381,7 @@ function UnifiedCarHandler:HandleCar(car)
 		prompt.Enabled = false
 		releaseControls(false)
 
-		Hud.SetVisible(true)
+		Hud.SetVisible(false)
 		startSnd()
 
 		diedConnection = currentHumanoid.Died:Connect(leaveCar)
