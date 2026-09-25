@@ -948,6 +948,33 @@ function UnifiedCarHandler:HandleCar(car)
 			rolling_resistance = 0.015
 		},
 	}
+	
+	-- Fake drivetrain — no torque curves, no clutch-coupling math, just numbers
+	-- tuned to feel right for HUD/sound and for actually moving the car.
+	local FAKE_ENGINE = {
+		idleRpm = 950,
+		redlineRpm = 7800,
+		revLimiterBounce = 400,   -- how hard it bounces off the limiter
+		revRateUp = 6500,         -- RPM/sec climbing under throttle
+		revRateDown = 4500,       -- RPM/sec falling off-throttle
+		shiftDrop = 1800,         -- RPM lost on an upshift
+	}
+
+	-- Purely cosmetic per-gear "punch" — lower gears pull harder, higher gears
+	-- glide. Sign matches direction (reverse is negative). Tune these by feel.
+	local GEAR_ACCEL_FORCE = {
+		[-1] = -140, -- reverse
+		[0]  = 0,    -- neutral
+		[1]  = 220,
+		[2]  = 175,
+		[3]  = 140,
+		[4]  = 112,
+		[5]  = 90,
+		[6]  = 74,
+	}
+
+	local fakeRpm = FAKE_ENGINE.idleRpm
+	local lastRpmGear = 0
 
 	engineRPM = stats.engine.idlerpm
 	local transmission = stats.transmission
@@ -1182,42 +1209,40 @@ function UnifiedCarHandler:HandleCar(car)
 		local gearRatio = transmission.gears[gear + 2] or 0
 		local totalRatio = gearRatio * transmission.final_drive
 		local inGear = totalRatio ~= 0
-		local engaged = inGear and clutch < 0.9
 
-		-- Replace the whole "if engaged / else" RPM block with this:
-
-		local wheelAngularSpeed = carSpeedFront / wheelRadius
-		local wheelRpm = math.clamp(
-			math.abs(wheelAngularSpeed * totalRatio) * (30 / math.pi),
-			engineConfig.idlerpm,
-			engineConfig.redline
-		)
-
-		local freeRevTarget = engineConfig.idlerpm + (engineConfig.redline - engineConfig.idlerpm) * throttle
-
-		-- clutch = 0 -> fully locked to the wheels, clutch = 1 -> free-revving
-		local targetRpm = if inGear then (wheelRpm * (1 - clutch) + freeRevTarget * clutch) else freeRevTarget
-
-		-- faster response when clutch is out (more "connected"), slower when slipping/neutral
-		local revRate = 3 + throttle * 4 + (1 - clutch) * 6
-
-		engineRPM += (targetRpm - engineRPM) * math.min(dt * revRate, 1)
-		engineRPM = math.clamp(engineRPM, engineConfig.idlerpm, engineConfig.redline)
-		car:SetAttribute("RPM", engineRPM)
-
-		local engineTorque = getEngineTorque(engineConfig, engineRPM) * engineConfig.volumetric_efficiency * throttle
-
-		-- Speed the wheel would spin at if fully coupled to the engine through the
-		-- gearbox. Falls back to the car's own ground speed (zero slip) when
-		-- there's no torque path (neutral, or throttle closed) instead of
-		-- defaulting to 0.
-		local drivenSpeed = carSpeedFront
-
-		if inGear then
-			local coupling = 1 - clutch
-			local lockRate = 12 -- tune this; higher = snappier clutch lockup
-			engineRPM += (wheelRpm - engineRPM) * math.min(dt * lockRate * coupling, 1)
+		-- ---- Fake RPM (display/sound only — never feeds physics) ----
+		if gear ~= lastRpmGear then
+			fakeRpm = math.max(FAKE_ENGINE.idleRpm, fakeRpm - FAKE_ENGINE.shiftDrop)
+			lastRpmGear = gear
 		end
+
+		local rpmTarget
+		if clutch > 0.9 or gear == 0 then
+			-- clutch in / neutral: RPM just follows throttle, free-revving
+			rpmTarget = FAKE_ENGINE.idleRpm + (FAKE_ENGINE.redlineRpm - FAKE_ENGINE.idleRpm) * throttle
+		else
+			-- in gear: blend throttle with road speed so it still *feels* connected
+			-- to how fast you're going, with no real coupling underneath
+			local speedFactor = math.clamp(math.abs(carSpeedFront) / 40, 0, 1) -- tune 40 to your top speed
+			local blend = math.clamp(throttle * 0.7 + speedFactor * 0.5, 0, 1)
+			rpmTarget = FAKE_ENGINE.idleRpm + (FAKE_ENGINE.redlineRpm - FAKE_ENGINE.idleRpm) * blend
+		end
+
+		local rpmRate = if rpmTarget > fakeRpm then FAKE_ENGINE.revRateUp else FAKE_ENGINE.revRateDown
+		fakeRpm += math.clamp(rpmTarget - fakeRpm, -rpmRate * dt, rpmRate * dt)
+
+		if fakeRpm >= FAKE_ENGINE.redlineRpm then
+			fakeRpm = FAKE_ENGINE.redlineRpm - math.random() * FAKE_ENGINE.revLimiterBounce
+		end
+
+		fakeRpm = math.clamp(fakeRpm, FAKE_ENGINE.idleRpm, FAKE_ENGINE.redlineRpm)
+		car:SetAttribute("RPM", fakeRpm)
+
+		-- ---- Fake acceleration (this is what actually moves the car) ----
+		local gearForce = GEAR_ACCEL_FORCE[gear] or 0
+		local driveInput = gearForce * throttle * (1 - clutch)
+
+		local drivenSpeed = carSpeedFront + driveInput * 1.4 -- tune 1.4 for punchiness
 
 		-- Blend "coupled to the engine" (clutch up) with "free-rolling with the
 		-- ground" (clutch down), then bleed the result toward 0 as the brake is
@@ -1236,9 +1261,9 @@ function UnifiedCarHandler:HandleCar(car)
 			Hud.Update({
 				gear = gear,
 				speedKmh = speedKmh,
-				rpm = engineRPM,
-				redlineRpm = engineConfig.redline,
-				redlineWarnRpm = engineConfig.redline * 0.9,
+				rpm = fakeRpm,
+				redlineRpm = FAKE_ENGINE.redlineRpm,
+				redlineWarnRpm = FAKE_ENGINE.redlineRpm * 0.9,
 				throttle = throttle,
 				brake = brake,
 				clutch = clutch,
