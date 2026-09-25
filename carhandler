@@ -27,15 +27,17 @@ local CONFIG = {
 	AutoFirstGearOnEnter = true,
 	StudsToMeters = 0.28,
 }
-local STALL_FACTOR = 0.08
+local STALL_FACTOR = 0.05
+
 local GEAR_ENVELOPE = {
-	[-1] = { MinSpeed = 0,  PeakSpeed = 4,  MaxSpeed = 26  },
-	[1]  = { MinSpeed = 0,  PeakSpeed = 6,  MaxSpeed = 34  },
-	[2]  = { MinSpeed = 4,  PeakSpeed = 16, MaxSpeed = 58  },
-	[3]  = { MinSpeed = 10, PeakSpeed = 30, MaxSpeed = 88  },
-	[4]  = { MinSpeed = 20, PeakSpeed = 48, MaxSpeed = 124 },
-	[5]  = { MinSpeed = 34, PeakSpeed = 70, MaxSpeed = 165 },
-	[6]  = { MinSpeed = 50, PeakSpeed = 95, MaxSpeed = 210 },
+	[-1] = { MinSpeed = 0,  PeakSpeed = 5,  MaxSpeed = 28  },
+
+	[1]  = { MinSpeed = 0,  PeakSpeed = 8,  MaxSpeed = 38  },
+	[2]  = { MinSpeed = 5,  PeakSpeed = 20, MaxSpeed = 63  },
+	[3]  = { MinSpeed = 12, PeakSpeed = 35, MaxSpeed = 94  },
+	[4]  = { MinSpeed = 22, PeakSpeed = 54, MaxSpeed = 132 },
+	[5]  = { MinSpeed = 38, PeakSpeed = 78, MaxSpeed = 174 },
+	[6]  = { MinSpeed = 55, PeakSpeed = 105, MaxSpeed = 220 },
 }
 
 local SND_CFG = {
@@ -53,25 +55,25 @@ local SND_CFG = {
 		minPlayback = 0.55,
 		maxPlayback = 2.35,
 		playbackCurve = 0.8,
-		baseVolume = 0.25,
+		baseVolume = 0.4,
 		maxVolume = 1.0,
-		loadVolumeBoost = 0.55,
+		loadVolumeBoost = 0.7,
 		accelPlaybackBoost = 0.035,
 		smoothing = 6,
 		rpmSmoothing = 14,
 	},
 
 	Whine = {
-		minSpeed = 2,
+		minSpeed = 0,
 		maxSpeed = 140,
-		minPlayback = 0.6,
-		maxPlayback = 1.9,
-		baseVolume = 0.06,
-		maxVolume = 0.42,
-		loadVolume = 0.18,
-		clutchRelease = 0.4,
+		minPlayback = 0.75,
+		maxPlayback = 2.6,
+		baseVolume = 0.4,
+		maxVolume = 1.0,
+		loadVolume = 0.45,
+		clutchRelease = 0.12,
 		smoothing = 10,
-		driveSpeedScale = 0.11,
+		driveSpeedScale = 0.16,
 	},
 
 	Throttle = { smoothing = 16 },
@@ -1021,14 +1023,14 @@ function UnifiedCarHandler:HandleCar(car)
 	}
 
 	local GEAR_ACCEL_FORCE = {
-		[-1] = -140,
+		[-1] = -105,
 		[0]  = 0,
-		[1]  = 220,
-		[2]  = 175,
-		[3]  = 140,
-		[4]  = 112,
-		[5]  = 90,
-		[6]  = 74,
+		[1]  = 160,
+		[2]  = 128,
+		[3]  = 102,
+		[4]  = 82,
+		[5]  = 66,
+		[6]  = 54,
 	}
 
 	local fakeRpm = FAKE_ENGINE.idleRpm
@@ -1260,7 +1262,7 @@ function UnifiedCarHandler:HandleCar(car)
 
 		local rpmPresence = math.clamp((aRpm - revCfg.minRPM) / math.max(revCfg.maxRPM - revCfg.minRPM, 1), 0, 1)
 		local throttleLoadPresence = math.clamp(aThr * 0.45 + aLoad * 0.55, 0, 1)
-		local revTargetVolume = mix(revCfg.baseVolume, revCfg.maxVolume, math.clamp(rpmPresence * 0.55 + throttleLoadPresence * 0.65, 0, 1))
+		local revTargetVolume = mix(revCfg.baseVolume, revCfg.maxVolume, math.clamp(rpmPresence * 0.7 + throttleLoadPresence * 0.75, 0, 1))
 		revTargetVolume += aLoad * revCfg.loadVolumeBoost
 		revTargetVolume = math.clamp(revTargetVolume, 0, revCfg.maxVolume)
 
@@ -1526,7 +1528,7 @@ function UnifiedCarHandler:HandleCar(car)
 		local powerFactor = gearPower(gear, carSpeedFront)
 		local driveInput = gearForce * throttle * (1 - clutch) * powerFactor
 
-		local wheelSpeed = (carSpeedFront + driveInput * 1.4) * (1 - brake)
+		local wheelSpeed = (carSpeedFront + driveInput * 1.1) * (1 - brake)
 
 		for _, attribute in WHEEL_SPEED_ATTRIBUTES do
 			car:SetAttribute(attribute, wheelSpeed)
