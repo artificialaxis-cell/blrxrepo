@@ -3,7 +3,6 @@ local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 
-
 local CONFIG = {
 	EnterKey = Enum.KeyCode.E,
 	EnterGamepadKey = Enum.KeyCode.ButtonX,
@@ -20,8 +19,6 @@ local CONFIG = {
 	PromptActionText = "Drive",
 	PromptDistance = 12,
 
-	HiddenCFrame = CFrame.new(0, -450, 0),
-	HideAnchorDelay = 0.15,
 	EnterInputGuard = 0.25,
 	ExitSideClearance = 3,
 	ExitHeight = 2,
@@ -445,6 +442,28 @@ local function resolveCar(car)
 	}
 end
 
+local function setCollisionsEnabled(targetCharacter, enabled, cache)
+	if not targetCharacter then
+		return
+	end
+
+	if enabled then
+		for part, originalValue in pairs(cache) do
+			if part.Parent then
+				part.CanCollide = originalValue
+			end
+		end
+		table.clear(cache)
+	else
+		for _, part in ipairs(targetCharacter:GetDescendants()) do
+			if part:IsA("BasePart") then
+				cache[part] = part.CanCollide
+				part.CanCollide = false
+			end
+		end
+	end
+end
+
 local function flatten(vector, fallback)
 	local flat = Vector3.new(vector.X, 0, vector.Z)
 	if flat.Magnitude < 0.01 then
@@ -536,6 +555,9 @@ function UnifiedCarHandler:HandleCar(car)
 	local driverMass = parts.driverMass
 	local drag = parts.drag
 	local steerSlide = parts.steerSlide
+	local connections = {}
+	local activeTweens = {}
+	local collisionCache = {}
 
 	local raycastParams = RaycastParams.new()
 	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -711,11 +733,7 @@ function UnifiedCarHandler:HandleCar(car)
 			diedConnection = nil
 		end
 
-		local subject = if humanoid and humanoid.Parent then humanoid else nil
-		local camera = workspace.CurrentCamera
-		if camera and subject then
-			camera.CameraSubject = subject
-		end
+		setCollisionsEnabled(character, true, collisionCache)
 
 		if rootPart and rootPart.Parent then
 			rootPart.Anchored = false
@@ -731,18 +749,6 @@ function UnifiedCarHandler:HandleCar(car)
 		if alive and prompt.Parent then
 			prompt.Enabled = true
 		end
-	end
-
-	local function hideCharacter(root)
-		root.AssemblyLinearVelocity = Vector3.zero
-		root.AssemblyAngularVelocity = Vector3.zero
-		root.CFrame = CONFIG.HiddenCFrame
-
-		task.delay(CONFIG.HideAnchorDelay, function()
-			if driving and rootPart == root and root.Parent then
-				root.Anchored = true
-			end
-		end)
 	end
 
 	local function enterCar()
@@ -767,13 +773,6 @@ function UnifiedCarHandler:HandleCar(car)
 
 		prompt.Enabled = false
 		releaseControls(false)
-
-		hideCharacter(currentRoot)
-
-		local camera = workspace.CurrentCamera
-		if camera then
-			camera.CameraSubject = primary
-		end
 
 		diedConnection = currentHumanoid.Died:Connect(leaveCar)
 	end
@@ -830,17 +829,17 @@ function UnifiedCarHandler:HandleCar(car)
 			return
 		end
 
+		if driving and rootPart and rootPart.Parent then
+			rootPart.CFrame = mass.CFrame
+		end
+
 		local frameScale = dt * 60
 
 		local steerTime = stats.steer_response_time_inactive
 		local targetSteer = 0
 		local mouseControlled = false
+
 		if driving and not UserInputService:GetFocusedTextBox() then
-			local camera = workspace.CurrentCamera
-			if camera then
-				camera.CameraSubject = primary
-			end
-			
 			if mouseSteer then
 				local viewportWidth = math.max(workspace.CurrentCamera.ViewportSize.X, 1)
 				steerValue.Value = math.clamp((UserInputService:GetMouseLocation().X / viewportWidth) * 2 - 1, -1, 1)
