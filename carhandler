@@ -30,14 +30,14 @@ local CONFIG = {
 local STALL_FACTOR = 0.1
 
 local GEAR_ENVELOPE = {
-	[-1] = { PeakSpeed = 15,  MaxSpeed = 58  },
+	[-1] = { PeakSpeed = 15,  MaxSpeed = 58 },
 
-	[1]  = { PeakSpeed = 25,  MaxSpeed = 60  },
-	[2]  = { PeakSpeed = 50,  MaxSpeed = 124 },
-	[3]  = { PeakSpeed = 75,  MaxSpeed = 165 },
-	[4]  = { PeakSpeed = 102, MaxSpeed = 195 },
-	[5]  = { PeakSpeed = 150, MaxSpeed = 220 },
-	[6]  = { PeakSpeed = 200, MaxSpeed = 252 },
+	[1]  = { PeakSpeed = 25,  MaxSpeed = 60 },
+	[2]  = { PeakSpeed = 52,  MaxSpeed = 124 },
+	[3]  = { PeakSpeed = 82,  MaxSpeed = 175 },
+	[4]  = { PeakSpeed = 110, MaxSpeed = 205 },
+	[5]  = { PeakSpeed = 145, MaxSpeed = 235 },
+	[6]  = { PeakSpeed = 190, MaxSpeed = 270 },
 }
 
 local SND_CFG = {
@@ -1021,14 +1021,14 @@ function UnifiedCarHandler:HandleCar(car)
 	}
 
 	local GEAR_ACCEL_FORCE = {
-		[-1] = -105,
+		[-1] = -70,
 		[0]  = 0,
-		[1]  = 160,
-		[2]  = 128,
-		[3]  = 102,
-		[4]  = 82,
-		[5]  = 66,
-		[6]  = 54,
+		[1]  = 100,
+		[2]  = 82,
+		[3]  = 68,
+		[4]  = 56,
+		[5]  = 46,
+		[6]  = 38,
 	}
 
 	local fakeRpm = FAKE_ENGINE.idleRpm
@@ -1526,7 +1526,8 @@ function UnifiedCarHandler:HandleCar(car)
 					* aero.Cd
 					* aero.area
 					* speedMS
-					* speedMS				
+					* speedMS
+
 				dragForce = -velocity.Unit * Vector3.new(1, 0.5, 1) * magnitude
 			end
 
