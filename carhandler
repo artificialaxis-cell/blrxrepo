@@ -700,6 +700,38 @@ function FrictionSimulation.Update(tireInfo)
 	car:SetAttribute(folder.Name .. "totalSlip", totalSlip)
 end
 
+local RenameTable = {
+	["ForceAtt"] = {
+		"ForceAtt_2",
+		"ForceAtt_3",
+		"ForceAtt_4",
+	},
+	["SteerSlide"] = {
+		"SteerSlide_2"
+	},
+	["TIREEND"] = {
+		"TIREEND_2",
+		"TIREEND_3",
+		"TIREEND_4"
+	},
+	["TIRESTART"] = {
+		"TIRESTART_2",
+		"TIRESTART_3",
+		"TIRESTART_4"
+	},
+}
+
+local function RenameClones(parent)
+	for originalName, clones in pairs(RenameTable) do
+		for _, cloneName in ipairs(clones) do
+			local child = parent:FindFirstChild(cloneName,true)
+			if child then
+				child.Name = originalName
+			end
+		end
+	end
+end
+
 local function resolveCar(car)
 	for _, name in ipairs(REQUIRED_CHILDREN) do
 		if not car:FindFirstChild(name) then
@@ -714,6 +746,8 @@ local function resolveCar(car)
 			return nil
 		end
 	end
+	
+	RenameClones(car)
 
 	local mass = car.Mass
 	local primary = car.Primary
