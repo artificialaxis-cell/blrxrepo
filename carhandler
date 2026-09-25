@@ -1019,7 +1019,7 @@ function UnifiedCarHandler:HandleCar(car)
 		revLimiterBounce = 400,
 		revRateUp = 6500,
 		revRateDown = 4500,
-		shiftDrop = 1800,
+		shiftDrop = 600,
 	}
 
 	local GEAR_ACCEL_FORCE = {
