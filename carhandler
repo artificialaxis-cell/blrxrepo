@@ -23,6 +23,9 @@ local CONFIG = {
 	ExitSideClearance = 3,
 	ExitHeight = 2,
 	StartDelay = 0.5,
+
+	AutoFirstGearOnEnter = true,
+	StudsToMeters = 0.28, -- tune to your world scale; affects only the HUD's km/h readout
 }
 
 local WHEEL_SPEED_ATTRIBUTES = {
@@ -517,6 +520,232 @@ local function getEngineTorque(engine, rpm)
 	return curve[points[#points]]
 end
 
+--------------------------------------------------------------------------------
+-- HUD (Assetto-Corsa style pedal/gear/RPM cluster). Singleton: one instance
+-- shared across every car this handler manages.
+--------------------------------------------------------------------------------
+
+local Hud = {}
+
+local function createPedalBar(parent, color, position, size, label)
+	local container = Instance.new("Frame")
+	container.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
+	container.BorderSizePixel = 0
+	container.Position = position
+	container.Size = size
+	container.Parent = parent
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 4)
+	corner.Parent = container
+
+	local fill = Instance.new("Frame")
+	fill.BackgroundColor3 = color
+	fill.BorderSizePixel = 0
+	fill.Size = UDim2.new(0, 0, 1, 0)
+	fill.Parent = container
+
+	local fillCorner = Instance.new("UICorner")
+	fillCorner.CornerRadius = UDim.new(0, 4)
+	fillCorner.Parent = fill
+
+	local caption = Instance.new("TextLabel")
+	caption.BackgroundTransparency = 1
+	caption.Text = label
+	caption.Font = Enum.Font.GothamBold
+	caption.TextColor3 = Color3.fromRGB(200, 200, 206)
+	caption.TextSize = 11
+	caption.TextXAlignment = Enum.TextXAlignment.Left
+	caption.Position = UDim2.new(0, 6, 0, -15)
+	caption.Size = UDim2.new(1, -12, 0, 14)
+	caption.Parent = container
+
+	return fill
+end
+
+function Hud.Build()
+	if Hud.built then
+		return
+	end
+	Hud.built = true
+
+	local player = Players.LocalPlayer
+	local playerGui = player:WaitForChild("PlayerGui")
+
+	local existing = playerGui:FindFirstChild("DrivingHUD")
+	if existing then
+		existing:Destroy()
+	end
+
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "DrivingHUD"
+	screenGui.ResetOnSpawn = false
+	screenGui.IgnoreGuiInset = true
+	screenGui.DisplayOrder = 50
+	screenGui.Enabled = false
+	screenGui.Parent = playerGui
+
+	local root = Instance.new("Frame")
+	root.AnchorPoint = Vector2.new(0.5, 1)
+	root.Position = UDim2.new(0.5, 0, 1, -24)
+	root.Size = UDim2.new(0, 560, 0, 150)
+	root.BackgroundColor3 = Color3.fromRGB(18, 18, 20)
+	root.BackgroundTransparency = 0.12
+	root.BorderSizePixel = 0
+	root.Parent = screenGui
+
+	local rootCorner = Instance.new("UICorner")
+	rootCorner.CornerRadius = UDim.new(0, 10)
+	rootCorner.Parent = root
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(60, 60, 66)
+	stroke.Thickness = 1
+	stroke.Parent = root
+
+	-- Gear box
+	local gearFrame = Instance.new("Frame")
+	gearFrame.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+	gearFrame.Position = UDim2.new(0, 14, 0, 14)
+	gearFrame.Size = UDim2.new(0, 84, 0, 84)
+	gearFrame.Parent = root
+
+	local gearCorner = Instance.new("UICorner")
+	gearCorner.CornerRadius = UDim.new(0, 8)
+	gearCorner.Parent = gearFrame
+
+	local gearLabel = Instance.new("TextLabel")
+	gearLabel.BackgroundTransparency = 1
+	gearLabel.Font = Enum.Font.GothamBlack
+	gearLabel.Text = "N"
+	gearLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	gearLabel.TextSize = 42
+	gearLabel.Size = UDim2.new(1, 0, 1, 0)
+	gearLabel.Parent = gearFrame
+
+	local gearCaption = Instance.new("TextLabel")
+	gearCaption.BackgroundTransparency = 1
+	gearCaption.Font = Enum.Font.GothamBold
+	gearCaption.Text = "GEAR"
+	gearCaption.TextColor3 = Color3.fromRGB(140, 140, 148)
+	gearCaption.TextSize = 12
+	gearCaption.Position = UDim2.new(0, 0, 1, 2)
+	gearCaption.Size = UDim2.new(1, 0, 0, 14)
+	gearCaption.Parent = gearFrame
+
+	-- Speed readout
+	local speedLabel = Instance.new("TextLabel")
+	speedLabel.BackgroundTransparency = 1
+	speedLabel.Font = Enum.Font.GothamBlack
+	speedLabel.Text = "0"
+	speedLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	speedLabel.TextSize = 34
+	speedLabel.TextXAlignment = Enum.TextXAlignment.Left
+	speedLabel.Position = UDim2.new(0, 112, 0, 12)
+	speedLabel.Size = UDim2.new(0, 120, 0, 40)
+	speedLabel.Parent = root
+
+	local speedUnit = Instance.new("TextLabel")
+	speedUnit.BackgroundTransparency = 1
+	speedUnit.Font = Enum.Font.GothamBold
+	speedUnit.Text = "km/h"
+	speedUnit.TextColor3 = Color3.fromRGB(140, 140, 148)
+	speedUnit.TextSize = 13
+	speedUnit.TextXAlignment = Enum.TextXAlignment.Left
+	speedUnit.Position = UDim2.new(0, 112, 0, 50)
+	speedUnit.Size = UDim2.new(0, 120, 0, 16)
+	speedUnit.Parent = root
+
+	-- RPM bar
+	local rpmContainer = Instance.new("Frame")
+	rpmContainer.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+	rpmContainer.Position = UDim2.new(0, 112, 0, 70)
+	rpmContainer.Size = UDim2.new(0, 434, 0, 16)
+	rpmContainer.Parent = root
+
+	local rpmCorner = Instance.new("UICorner")
+	rpmCorner.CornerRadius = UDim.new(0, 6)
+	rpmCorner.Parent = rpmContainer
+
+	local rpmFill = Instance.new("Frame")
+	rpmFill.BackgroundColor3 = Color3.fromRGB(70, 200, 120)
+	rpmFill.BorderSizePixel = 0
+	rpmFill.Size = UDim2.new(0, 0, 1, 0)
+	rpmFill.Parent = rpmContainer
+
+	local rpmFillCorner = Instance.new("UICorner")
+	rpmFillCorner.CornerRadius = UDim.new(0, 6)
+	rpmFillCorner.Parent = rpmFill
+
+	local rpmGradient = Instance.new("UIGradient")
+	rpmGradient.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(70, 200, 120)),
+		ColorSequenceKeypoint.new(0.7, Color3.fromRGB(240, 200, 60)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(230, 60, 60)),
+	})
+	rpmGradient.Parent = rpmFill
+
+	local redlineMarker = Instance.new("Frame")
+	redlineMarker.BackgroundColor3 = Color3.fromRGB(230, 60, 60)
+	redlineMarker.BorderSizePixel = 0
+	redlineMarker.Size = UDim2.new(0, 2, 1, 0)
+	redlineMarker.ZIndex = 2
+	redlineMarker.Parent = rpmContainer
+
+	local rpmText = Instance.new("TextLabel")
+	rpmText.BackgroundTransparency = 1
+	rpmText.Font = Enum.Font.GothamBold
+	rpmText.Text = "0 RPM"
+	rpmText.TextColor3 = Color3.fromRGB(210, 210, 215)
+	rpmText.TextSize = 12
+	rpmText.TextXAlignment = Enum.TextXAlignment.Right
+	rpmText.Position = UDim2.new(0, 112, 0, 88)
+	rpmText.Size = UDim2.new(0, 434, 0, 14)
+	rpmText.Parent = root
+
+	-- Pedal bars
+	local throttleFill = createPedalBar(root, Color3.fromRGB(70, 200, 120), UDim2.new(0, 112, 0, 116), UDim2.new(0, 138, 0, 18), "THROTTLE")
+	local brakeFill = createPedalBar(root, Color3.fromRGB(230, 70, 70), UDim2.new(0, 262, 0, 116), UDim2.new(0, 138, 0, 18), "BRAKE")
+	local clutchFill = createPedalBar(root, Color3.fromRGB(80, 150, 230), UDim2.new(0, 412, 0, 116), UDim2.new(0, 134, 0, 18), "CLUTCH")
+
+	Hud.screenGui = screenGui
+	Hud.gearLabel = gearLabel
+	Hud.speedLabel = speedLabel
+	Hud.rpmFill = rpmFill
+	Hud.rpmText = rpmText
+	Hud.redlineMarker = redlineMarker
+	Hud.throttleFill = throttleFill
+	Hud.brakeFill = brakeFill
+	Hud.clutchFill = clutchFill
+end
+
+function Hud.SetVisible(visible)
+	Hud.Build()
+	Hud.screenGui.Enabled = visible
+end
+
+function Hud.Update(state)
+	if not Hud.built then
+		return
+	end
+
+	Hud.gearLabel.Text = if state.gear < 0 then "R" elseif state.gear == 0 then "N" else tostring(state.gear)
+	Hud.speedLabel.Text = string.format("%d", math.floor(state.speedKmh + 0.5))
+
+	local rpmAlpha = math.clamp(state.rpm / state.redlineRpm, 0, 1)
+	Hud.rpmFill.Size = UDim2.new(rpmAlpha, 0, 1, 0)
+	Hud.rpmText.Text = string.format("%d RPM", math.floor(state.rpm + 0.5))
+
+	local redlineAlpha = math.clamp(state.redlineWarnRpm / state.redlineRpm, 0, 1)
+	Hud.redlineMarker.Position = UDim2.new(redlineAlpha, 0, 0, 0)
+
+	Hud.throttleFill.Size = UDim2.new(math.clamp(state.throttle, 0, 1), 0, 1, 0)
+	Hud.brakeFill.Size = UDim2.new(math.clamp(state.brake, 0, 1), 0, 1, 0)
+	Hud.clutchFill.Size = UDim2.new(math.clamp(state.clutch, 0, 1), 0, 1, 0)
+end
+
+--------------------------------------------------------------------------------
+
 local handledCars = setmetatable({}, { __mode = "k" })
 
 local UnifiedCarHandler = {}
@@ -555,9 +784,6 @@ function UnifiedCarHandler:HandleCar(car)
 	local driverMass = parts.driverMass
 	local drag = parts.drag
 	local steerSlide = parts.steerSlide
-	local connections = {}
-	local activeTweens = {}
-	local collisionCache = {}
 
 	local raycastParams = RaycastParams.new()
 	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -578,6 +804,7 @@ function UnifiedCarHandler:HandleCar(car)
 
 	local connections = {}
 	local activeTweens = {}
+	local collisionCache = {}
 
 	local prompt = Instance.new("ProximityPrompt")
 	prompt.Name = "EnterCarPrompt"
@@ -724,6 +951,8 @@ function UnifiedCarHandler:HandleCar(car)
 		end
 		driving = false
 
+		Hud.SetVisible(false)
+
 		local exitCFrame = computeExitCFrame()
 
 		releaseControls(true)
@@ -764,6 +993,8 @@ function UnifiedCarHandler:HandleCar(car)
 			return
 		end
 
+		setCollisionsEnabled(currentCharacter, false, collisionCache)
+
 		driving = true
 		enteredAt = os.clock()
 		character = currentCharacter
@@ -771,8 +1002,14 @@ function UnifiedCarHandler:HandleCar(car)
 		rootPart = currentRoot
 		entryCFrame = currentRoot.CFrame
 
+		if CONFIG.AutoFirstGearOnEnter and gear == 0 then
+			gear = 1
+		end
+
 		prompt.Enabled = false
 		releaseControls(false)
+
+		Hud.SetVisible(true)
 
 		diedConnection = currentHumanoid.Died:Connect(leaveCar)
 	end
@@ -886,7 +1123,8 @@ function UnifiedCarHandler:HandleCar(car)
 		local wheelRadius = math.max(stats.wheel_radius, 0.1)
 		local gearRatio = transmission.gears[gear + 2] or 0
 		local totalRatio = gearRatio * transmission.final_drive
-		local engaged = clutch < 0.9 and totalRatio ~= 0
+		local inGear = totalRatio ~= 0
+		local engaged = inGear and clutch < 0.9
 
 		if engaged then
 			local wheelAngularSpeed = carSpeedFront / wheelRadius
@@ -901,22 +1139,44 @@ function UnifiedCarHandler:HandleCar(car)
 		car:SetAttribute("RPM", engineRPM)
 
 		local engineTorque = getEngineTorque(engineConfig, engineRPM) * engineConfig.volumetric_efficiency * throttle
-		local driveSpeed = 0
 
-		if totalRatio ~= 0 then
+		-- Speed the wheel would spin at if fully coupled to the engine through the
+		-- gearbox. Falls back to the car's own ground speed (zero slip) when
+		-- there's no torque path (neutral, or throttle closed) instead of
+		-- defaulting to 0.
+		local drivenSpeed = carSpeedFront
+
+		if inGear then
 			local wheelForce = (engineTorque * totalRatio * transmission.eff) / wheelRadius
 			local direction = if totalRatio > 0 then 1 else -1
-			driveSpeed = carSpeedFront + direction * (math.abs(wheelForce) / stats.mass) * 1.4
+			drivenSpeed = carSpeedFront + direction * (math.abs(wheelForce) / stats.mass) * 1.4
 		end
 
-		local wheelSpeed = (driveSpeed * (1 - clutch))
-			+ -carSpeedFront * ((1 - throttle) * 1 - clutch) * (1 - brake)
+		-- Blend "coupled to the engine" (clutch up) with "free-rolling with the
+		-- ground" (clutch down), then bleed the result toward 0 as the brake is
+		-- applied. The wheel speed now always tracks real velocity instead of
+		-- snapping to 0 whenever clutch/brake/throttle happened to combine that way.
+		local wheelSpeed = (drivenSpeed * (1 - clutch) + carSpeedFront * clutch) * (1 - brake)
 
 		for _, attribute in WHEEL_SPEED_ATTRIBUTES do
 			car:SetAttribute(attribute, wheelSpeed)
 		end
 		car:SetAttribute("rearWS", wheelSpeed)
 		car:SetAttribute("frontWS", wheelSpeed)
+
+		if driving then
+			local speedKmh = math.abs(carSpeedFront) * CONFIG.StudsToMeters * 3.6
+			Hud.Update({
+				gear = gear,
+				speedKmh = speedKmh,
+				rpm = engineRPM,
+				redlineRpm = engineConfig.redline,
+				redlineWarnRpm = engineConfig.redline * 0.9,
+				throttle = throttle,
+				brake = brake,
+				clutch = clutch,
+			})
+		end
 
 		local tireEnd = car:GetAttribute("tireend")
 
