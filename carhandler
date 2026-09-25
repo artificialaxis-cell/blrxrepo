@@ -820,42 +820,69 @@ function UnifiedCarHandler:HandleCar(car)
 	print("resolved, going stats")
 
 	stats = {
-		throttle_response_time = 0.18,
-		brake_response_time = 0.35,
-		clutch_response_time = 0.08,
-		steer_response_time_active = 2.4,
-		steer_response_time_inactive = 1.1,
+		throttle_response_time = 0.10,
+		brake_response_time = 0.22,
+		clutch_response_time = 0.05,
+
+		steer_response_time_active = 1.8,
+		steer_response_time_inactive = 0.9,
 
 		wheel_radius = car:GetAttribute("tireend"),
-		maxsteer = 48,
+
+		-- Steering
+		maxsteer = 34,
 		ackerman = true,
 		antiacker = false,
 
-		maxWheelTorque = 1450,
+		-- Drivetrain
+		maxWheelTorque = 1350,
+		COUPLING_STIFFNESS = 15,
 
 		engine = {
+			-- BMW-style turbo 4-cylinder race engine
 			cylinders = 4,
-			idlerpm = 850,
-			redline = 7500,
-			air_fuel_ratio = 11.8,
-			volumetric_efficiency = 0.92,
-			friction_loss = 0.14,
-			inertia = 2.4,
 
+			idlerpm = 950,
+			redline = 7800,
+
+			air_fuel_ratio = 12.2,
+			volumetric_efficiency = 0.95,
+
+			-- Mechanical losses
+			friction_loss = 0.12,
+
+			-- Lower inertia = sharper race-engine response
+			inertia = 1.8,
+
+			-- Nm
 			torqueCurve = {
-				[1000] = 280,
-				[1500] = 380,
-				[2500] = 520,
-				[3500] = 620,
-				[4500] = 650,
-				[5500] = 620,
-				[6500] = 560,
-				[7200] = 480
+				[1000] = 250,
+				[1500] = 340,
+				[2000] = 420,
+				[2500] = 470,
+				[3000] = 520,
+				[3500] = 550,
+				[4000] = 570,
+				[4500] = 570,
+				[5000] = 565,
+				[5500] = 555,
+				[6000] = 545,
+				[6500] = 525,
+				[7000] = 505,
+				[7200] = 490,
+				[7500] = 450,
+				[7800] = 400
 			},
 
-			maxtorque = 650,
-			rpmbounce = {min = 200, max = 800},
+			maxtorque = 570,
 
+			-- RPM bounce / limiter behavior
+			rpmbounce = {
+				min = 200,
+				max = 800
+			},
+
+			-- Startup
 			basestartupchance = 7,
 			startupinterval = 0.22,
 			maxhold = 4,
@@ -865,29 +892,60 @@ function UnifiedCarHandler:HandleCar(car)
 		mass = car.Mass:GetMass(),
 
 		transmission = {
-			gears = { -3.20, 0, 3.30, 2.28, 1.72, 1.30, 1.05 },
-			final_drive = 4.10,
-			shift_time = 0.11,
-			eff = 0.92,
-			type = "AWD",
+			-- Reverse / Neutral / 1-6
+			--
+			-- Straight-cut race gearbox
+			gears = {
+				-3.20,
+				0,
+
+				3.00,
+				2.10,
+				1.60,
+				1.28,
+				1.08,
+				0.91
+			},
+
+			-- Short final drive for circuit use
+			final_drive = 3.90,
+
+			-- Fast dog/sequential-style shifts
+			shift_time = 0.075,
+
+			-- Drivetrain efficiency
+			eff = 0.96,
+
+			-- BMW RWD
+			type = "RWD",
+
+			-- LSD-style behavior
 			difftype = "LOCK",
 
-			wheelinertia = 0.55,
+			-- Rotating wheel/driveline inertia
+			wheelinertia = 0.42,
 
+			-- RPM drop / ratio transition behavior
 			shiftratiochange = {
-				[1] = 0.42,
-				[2] = 0.50,
-				[3] = 0.60,
-				[4] = 0.72,
-				[5] = 0.85
+				[1] = 0.70,
+				[2] = 0.72,
+				[3] = 0.74,
+				[4] = 0.78,
+				[5] = 0.82
 			},
 		},
 
 		aero = {
 			rho = 1.225,
+
+			-- Moderate race-car drag
 			Cd = 0.32,
-			area = 2.25,
-			rolling_resistance = 0.6
+
+			-- Approximate frontal area
+			area = 2.15,
+
+			-- Tire/road rolling resistance
+			rolling_resistance = 0.015
 		},
 	}
 
@@ -1128,9 +1186,22 @@ function UnifiedCarHandler:HandleCar(car)
 
 		if engaged then
 			local wheelAngularSpeed = carSpeedFront / wheelRadius
-			local syncRpm = math.abs(wheelAngularSpeed * totalRatio) * (30 / math.pi)
-			engineRPM += (math.clamp(syncRpm, engineConfig.idlerpm, engineConfig.redline) - engineRPM)
-				* math.min(dt * 10, 1)
+			local wheelRpm = math.abs(wheelAngularSpeed * totalRatio) * (30 / math.pi)
+
+			local engineTorqueRaw = getEngineTorque(engineConfig, engineRPM)
+				* engineConfig.volumetric_efficiency * throttle
+			local frictionTorque = engineConfig.friction_loss * engineRPM -- crude engine braking
+
+			local netTorque = engineTorqueRaw - frictionTorque
+
+			if inGear then
+				local coupling = 1 - clutch -- 0 = pedal down/free, 1 = pedal up/locked
+				local rpmError = wheelRpm - engineRPM
+				netTorque += rpmError * coupling * stats.COUPLING_STIFFNESS -- tune this constant
+			end
+
+			engineRPM += (netTorque / engineConfig.inertia) * dt
+			engineRPM = math.clamp(engineRPM, engineConfig.idlerpm, engineConfig.redline)
 		else
 			local freeRevTarget = engineConfig.idlerpm + (engineConfig.redline - engineConfig.idlerpm) * throttle
 			engineRPM += (freeRevTarget - engineRPM) * math.min(dt * (3 + throttle * 4), 1)
