@@ -25,23 +25,26 @@ local CONFIG = {
 	StartDelay = 0.5,
 
 	AutoFirstGearOnEnter = true,
-	StudsToMeters = 0.28, -- tune to your world scale; affects only the HUD's km/h readout
+	StudsToMeters = 0.28,
+}
+local STALL_FACTOR = 0.08
+local GEAR_ENVELOPE = {
+	[-1] = { MinSpeed = 0,  PeakSpeed = 4,  MaxSpeed = 26  },
+	[1]  = { MinSpeed = 0,  PeakSpeed = 6,  MaxSpeed = 34  },
+	[2]  = { MinSpeed = 4,  PeakSpeed = 16, MaxSpeed = 58  },
+	[3]  = { MinSpeed = 10, PeakSpeed = 30, MaxSpeed = 88  },
+	[4]  = { MinSpeed = 20, PeakSpeed = 48, MaxSpeed = 124 },
+	[5]  = { MinSpeed = 34, PeakSpeed = 70, MaxSpeed = 165 },
+	[6]  = { MinSpeed = 50, PeakSpeed = 95, MaxSpeed = 210 },
 }
 
--- ============================================================
--- DYNAMIC VEHICLE AUDIO -- configuration
--- ============================================================
--- All three layers (Idle / Rev / Whine) read the vehicle's existing
--- `fakeRpm`, throttle/clutch/gear values and transmission data computed
--- in step(dt). Nothing here creates a second RPM simulation; it only
--- maps the numbers that already exist onto Volume / PlaybackSpeed.
-local AUDIO_CONFIG = {
+local SND_CFG = {
 	Idle = {
-		minRPM = 950,          -- at/below this RPM, idle is at maxVolume
-		maxRPM = 3200,         -- at/above this RPM, idle has faded to minVolume
-		minVolume = 0.03,      -- never fully silent -- keeps a faint low-end presence
+		minRPM = 950,
+		maxRPM = 3200,
+		minVolume = 0.03,
 		maxVolume = 0.55,
-		smoothing = 9,         -- volume response speed (higher = snappier)
+		smoothing = 9,
 	},
 
 	Rev = {
@@ -49,35 +52,35 @@ local AUDIO_CONFIG = {
 		maxRPM = 7800,
 		minPlayback = 0.55,
 		maxPlayback = 2.35,
-		playbackCurve = 0.8,   -- <1 = fast pitch rise low down, easing off near redline
-		baseVolume = 0.25,     -- quiet, off-load idle-adjacent tone
+		playbackCurve = 0.8,
+		baseVolume = 0.25,
 		maxVolume = 1.0,
-		loadVolumeBoost = 0.55,    -- extra volume from engine load
-		accelPlaybackBoost = 0.035, -- subtle extra pitch under hard load
+		loadVolumeBoost = 0.55,
+		accelPlaybackBoost = 0.035,
 		smoothing = 6,
-		rpmSmoothing = 14,     -- audioRPM tracks fakeRpm quickly ("very responsive")
+		rpmSmoothing = 14,
 	},
 
 	Whine = {
-		minSpeed = 2,          -- studs/sec drivetrain-speed proxy where whine starts to appear
+		minSpeed = 2,
 		maxSpeed = 140,
 		minPlayback = 0.6,
 		maxPlayback = 1.9,
 		baseVolume = 0.06,
 		maxVolume = 0.42,
-		loadVolume = 0.18,     -- extra volume from engine load (WHINE_LOAD_VOLUME)
-		clutchRelease = 0.4,   -- how much whine volume drops when clutch is fully pressed
-		smoothing = 10,        -- responsive but not jittery
-		driveSpeedScale = 0.11,-- scales (wheelSpeed * ratio * finalDrive) into the Speed range above
+		loadVolume = 0.18,
+		clutchRelease = 0.4,
+		smoothing = 10,
+		driveSpeedScale = 0.11,
 	},
 
 	Throttle = { smoothing = 16 },
 	Load = { smoothing = 5 },
 
-	ShiftReactionTime = 0.14,   -- seconds the "clutch disengagement" dip lasts after a gear change
-	ShiftDipStrength = 0.5,     -- how much Rev volume dips during that window (0-1, multiplicative)
+	ShiftReactionTime = 0.14,
+	ShiftDipStrength = 0.5,
 
-	FadeOutTime = 0.6,          -- seconds after leaving the car before sounds are Stop()'d
+	FadeOutTime = 0.6,
 }
 
 local WHEEL_SPEED_ATTRIBUTES = {
@@ -104,7 +107,7 @@ local REQUIRED_ATTRIBUTES = {
 	"tireend",
 }
 
-local TireSimulation = {}
+local TireSim = {}
 
 local SAMPLE_RADII = { 0.1, 0.2, 0.3, 0.4 }
 local DIAGONAL = math.sqrt(0.5)
@@ -123,6 +126,31 @@ for _, radius in ipairs(SAMPLE_RADII) do
 	table.insert(SAMPLE_OFFSETS, { diagonal, -diagonal })
 	table.insert(SAMPLE_OFFSETS, { -diagonal, diagonal })
 	table.insert(SAMPLE_OFFSETS, { -diagonal, -diagonal })
+end
+
+local function lerp(a, b, t)
+	return a + (b - a) * math.clamp(t, 0, 1)
+end
+
+local function gearPower(gear, forwardSpeed)
+	local envelope = GEAR_ENVELOPE[gear]
+	if not envelope then
+		return 1
+	end
+
+	local speed = math.abs(forwardSpeed)
+
+	if speed <= envelope.MinSpeed then
+		return STALL_FACTOR
+	elseif speed <= envelope.PeakSpeed then
+		local t = (speed - envelope.MinSpeed) / math.max(envelope.PeakSpeed - envelope.MinSpeed, 0.01)
+		return lerp(STALL_FACTOR, 1, t)
+	elseif speed <= envelope.MaxSpeed then
+		local t = (speed - envelope.PeakSpeed) / math.max(envelope.MaxSpeed - envelope.PeakSpeed, 0.01)
+		return lerp(1, 0, t)
+	else
+		return 0
+	end
 end
 
 local function getContactPoint(tire, origin, rayLength, raycastParams)
@@ -188,7 +216,7 @@ end
 
 local stat = {}
 
-function TireSimulation.Update(car, wheel, raycastParams)
+function TireSim.Update(car, wheel, raycastParams)
 	local springStrength = car:GetAttribute("psi") * 300
 	local damper = car:GetAttribute("damper")
 	local tireStart = car:GetAttribute("tirestart")
@@ -232,7 +260,7 @@ function TireSimulation.Update(car, wheel, raycastParams)
 	}
 end
 
-local FrictionSimulation = {}
+local FrictionSim = {}
 
 local MU_LOOKUP = {
 	[Enum.Material.Asphalt] = 1.9,
@@ -320,7 +348,7 @@ local function getSurfaceSpeed(tireInfo)
 	return 0
 end
 
-function FrictionSimulation.Update(tireInfo)
+function FrictionSim.Update(tireInfo)
 	local tire = tireInfo.tire
 	local car = tireInfo.car
 	local folder = tireInfo.folder
@@ -540,31 +568,20 @@ local function approach(current, target, speed, dt)
 	return current
 end
 
--- ============================================================
--- DYNAMIC VEHICLE AUDIO -- shared helpers
--- ============================================================
--- Frame-rate-independent exponential smoothing: `rate` is roughly "how many
--- times per second the value closes the gap to its target". Higher rate =
--- snappier response. This is used for every smoothed audio signal
--- (audioRPM, audioThrottle, audioLoad, audioWhineSpeed, and the volumes
--- themselves) so nothing pops or jitters frame to frame regardless of dt.
-local function audioSmooth(current, target, rate, dt)
+local function smoothTo(current, target, rate, dt)
 	local alpha = 1 - math.exp(-math.max(rate, 0) * dt)
 	return current + (target - current) * alpha
 end
 
-local function audioLerp(a, b, t)
+local function mix(a, b, t)
 	return a + (b - a) * math.clamp(t, 0, 1)
 end
 
--- Nonlinear RPM -> PlaybackSpeed mapping. `curve` < 1 makes the pitch climb
--- faster at low RPM and ease off approaching maxRPM (a more "race engine"
--- feel than a straight linear RPM/redline ratio).
-local function rpmToPlayback(rpm, minRPM, maxRPM, minPlayback, maxPlayback, curve)
+local function rpmToRate(rpm, minRPM, maxRPM, minPlayback, maxPlayback, curve)
 	local span = math.max(maxRPM - minRPM, 1)
 	local t = math.clamp((rpm - minRPM) / span, 0, 1)
 	t = t ^ (curve or 1)
-	return audioLerp(minPlayback, maxPlayback, t)
+	return mix(minPlayback, maxPlayback, t)
 end
 
 local function getEngineTorque(engine, rpm)
@@ -598,11 +615,6 @@ local function getEngineTorque(engine, rpm)
 
 	return curve[points[#points]]
 end
-
---------------------------------------------------------------------------------
--- HUD (Assetto-Corsa style pedal/gear/RPM cluster). Singleton: one instance
--- shared across every car this handler manages.
---------------------------------------------------------------------------------
 
 local Hud = {}
 
@@ -682,7 +694,6 @@ function Hud.Build()
 	stroke.Thickness = 1
 	stroke.Parent = root
 
-	-- Gear box
 	local gearFrame = Instance.new("Frame")
 	gearFrame.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
 	gearFrame.Position = UDim2.new(0, 14, 0, 14)
@@ -712,7 +723,6 @@ function Hud.Build()
 	gearCaption.Size = UDim2.new(1, 0, 0, 14)
 	gearCaption.Parent = gearFrame
 
-	-- Speed readout
 	local speedLabel = Instance.new("TextLabel")
 	speedLabel.BackgroundTransparency = 1
 	speedLabel.Font = Enum.Font.GothamBlack
@@ -735,7 +745,6 @@ function Hud.Build()
 	speedUnit.Size = UDim2.new(0, 120, 0, 16)
 	speedUnit.Parent = root
 
-	-- RPM bar
 	local rpmContainer = Instance.new("Frame")
 	rpmContainer.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
 	rpmContainer.Position = UDim2.new(0, 112, 0, 70)
@@ -782,7 +791,6 @@ function Hud.Build()
 	rpmText.Size = UDim2.new(0, 434, 0, 14)
 	rpmText.Parent = root
 
-	-- Pedal bars
 	local throttleFill = createPedalBar(root, Color3.fromRGB(70, 200, 120), UDim2.new(0, 112, 0, 116), UDim2.new(0, 138, 0, 18), "THROTTLE")
 	local brakeFill = createPedalBar(root, Color3.fromRGB(230, 70, 70), UDim2.new(0, 262, 0, 116), UDim2.new(0, 138, 0, 18), "BRAKE")
 	local clutchFill = createPedalBar(root, Color3.fromRGB(80, 150, 230), UDim2.new(0, 412, 0, 116), UDim2.new(0, 134, 0, 18), "CLUTCH")
@@ -823,8 +831,6 @@ function Hud.Update(state)
 	Hud.clutchFill.Size = UDim2.new(math.clamp(state.clutch, 0, 1), 0, 1, 0)
 end
 
---------------------------------------------------------------------------------
-
 local handledCars = setmetatable({}, { __mode = "k" })
 
 local UnifiedCarHandler = {}
@@ -844,7 +850,6 @@ function UnifiedCarHandler:HandleCar(car)
 		warn("UnifiedCarHandler:HandleCar must be called from a client script")
 		return
 	end
-	print("Resolving car")
 	local parts = resolveCar(car)
 	if not parts then
 		return
@@ -896,7 +901,6 @@ function UnifiedCarHandler:HandleCar(car)
 	prompt.RequiresLineOfSight = false
 	prompt.Enabled = false
 	prompt.Parent = driverMass or mass
-	print("resolved, going stats")
 
 	stats = {
 		throttle_response_time = 0.10,
@@ -908,17 +912,14 @@ function UnifiedCarHandler:HandleCar(car)
 
 		wheel_radius = car:GetAttribute("tireend"),
 
-		-- Steering
 		maxsteer = 34,
 		ackerman = true,
 		antiacker = false,
 
-		-- Drivetrain
 		maxWheelTorque = 1350,
 		COUPLING_STIFFNESS = 15,
 
 		engine = {
-			-- BMW-style turbo 4-cylinder race engine
 			cylinders = 4,
 
 			idlerpm = 950,
@@ -927,13 +928,10 @@ function UnifiedCarHandler:HandleCar(car)
 			air_fuel_ratio = 12.2,
 			volumetric_efficiency = 0.95,
 
-			-- Mechanical losses
 			friction_loss = 0.12,
 
-			-- Lower inertia = sharper race-engine response
 			inertia = 1.8,
 
-			-- Nm
 			torqueCurve = {
 				[1000] = 250,
 				[1500] = 340,
@@ -955,13 +953,11 @@ function UnifiedCarHandler:HandleCar(car)
 
 			maxtorque = 570,
 
-			-- RPM bounce / limiter behavior
 			rpmbounce = {
 				min = 200,
 				max = 800
 			},
 
-			-- Startup
 			basestartupchance = 7,
 			startupinterval = 0.22,
 			maxhold = 4,
@@ -971,9 +967,6 @@ function UnifiedCarHandler:HandleCar(car)
 		mass = car.Mass:GetMass(),
 
 		transmission = {
-			-- Reverse / Neutral / 1-6
-			--
-			-- Straight-cut race gearbox
 			gears = {
 				-3.20,
 				0,
@@ -986,25 +979,18 @@ function UnifiedCarHandler:HandleCar(car)
 				0.91
 			},
 
-			-- Short final drive for circuit use
 			final_drive = 3.90,
 
-			-- Fast dog/sequential-style shifts
 			shift_time = 0.075,
 
-			-- Drivetrain efficiency
 			eff = 0.96,
 
-			-- BMW RWD
 			type = "RWD",
 
-			-- LSD-style behavior
 			difftype = "LOCK",
 
-			-- Rotating wheel/driveline inertia
 			wheelinertia = 0.42,
 
-			-- RPM drop / ratio transition behavior
 			shiftratiochange = {
 				[1] = 0.70,
 				[2] = 0.72,
@@ -1017,33 +1003,26 @@ function UnifiedCarHandler:HandleCar(car)
 		aero = {
 			rho = 1.225,
 
-			-- Moderate race-car drag
 			Cd = 0.32,
 
-			-- Approximate frontal area
 			area = 2.15,
 
-			-- Tire/road rolling resistance
 			rolling_resistance = 0.015
 		},
 	}
-	
-	-- Fake drivetrain — no torque curves, no clutch-coupling math, just numbers
-	-- tuned to feel right for HUD/sound and for actually moving the car.
+
 	local FAKE_ENGINE = {
 		idleRpm = 950,
 		redlineRpm = 7800,
-		revLimiterBounce = 400,   -- how hard it bounces off the limiter
-		revRateUp = 6500,         -- RPM/sec climbing under throttle
-		revRateDown = 4500,       -- RPM/sec falling off-throttle
-		shiftDrop = 1800,         -- RPM lost on an upshift
+		revLimiterBounce = 400,
+		revRateUp = 6500,
+		revRateDown = 4500,
+		shiftDrop = 1800,
 	}
 
-	-- Purely cosmetic per-gear "punch" — lower gears pull harder, higher gears
-	-- glide. Sign matches direction (reverse is negative). Tune these by feel.
 	local GEAR_ACCEL_FORCE = {
-		[-1] = -140, -- reverse
-		[0]  = 0,    -- neutral
+		[-1] = -140,
+		[0]  = 0,
 		[1]  = 220,
 		[2]  = 175,
 		[3]  = 140,
@@ -1109,248 +1088,199 @@ function UnifiedCarHandler:HandleCar(car)
 		return CFrame.lookAt(position, position + lookVector)
 	end
 
-	-- ============================================================
-	-- DYNAMIC VEHICLE AUDIO -- per-car state & functions
-	-- ============================================================
-	-- The three sound layers (Idle / Rev / Whine) live under car.Primary.
-	-- We look them up once, validate they're Sound instances, and disable
-	-- (warn once, don't error) any layer that's missing so the vehicle
-	-- keeps working even without full audio.
-	local audioIdleSound, audioRevSound, audioWhineSound
-	local audioIdleValid, audioRevValid, audioWhineValid = false, false, false
-	local audioWarned = {}
+	local idleSnd, revSnd, whineSnd
+	local idleOk, revOk, whineOk = false, false, false
+	local sndWarned = {}
 
-	-- Smoothed signals driving the audio (kept separate from the physics'
-	-- own smoothing so audio response speeds can be tuned independently).
-	local audioRPM = FAKE_ENGINE.idleRpm
-	local audioThrottle = 0
-	local audioLoad = 0
-	local audioWhineSpeed = 0
+	local aRpm = FAKE_ENGINE.idleRpm
+	local aThr = 0
+	local aLoad = 0
+	local aWhineSpd = 0
 
-	local audioIdleVolume = 0
-	local audioRevVolume = 0
-	local audioWhineVolume = 0
+	local idleVol = 0
+	local revVol = 0
+	local whineVol = 0
 
-	local audioPrevCarSpeed = 0
-	local audioPrevGear = gear
-	local audioShiftTimer = 0
+	local prevSpd = 0
+	local prevGear = gear
+	local shiftTimer = 0
 
-	local audioFadeOutTimer = 0
-	local audioFadingOut = false
-	local audioStopped = true
+	local fadeTimer = 0
+	local fadingOut = false
+	local sndStopped = true
 
-	local function warnMissingAudioLayer(layerName)
-		if not audioWarned[layerName] then
-			audioWarned[layerName] = true
+	local function warnMissingSnd(layerName)
+		if not sndWarned[layerName] then
+			sndWarned[layerName] = true
 			warn(string.format("UnifiedCarHandler: %s is missing or invalid Sound 'Primary.%s' -- that audio layer will be disabled", car:GetFullName(), layerName))
 		end
 	end
 
-	local function initAudio()
-		local idleInst = primary:FindFirstChild("Idle")
-		local revInst = primary:FindFirstChild("Rev")
-		local whineInst = primary:FindFirstChild("Whine")
+	local function initSnd()
+		local idleInst = primary:FindFirstChild("idle")
+		local revInst = primary:FindFirstChild("rev")
+		local whineInst = primary:FindFirstChild("whine")
 
 		if idleInst and idleInst:IsA("Sound") then
-			audioIdleSound = idleInst
-			audioIdleValid = true
-			audioIdleSound.Looped = true
-			audioIdleSound.Volume = 0
+			idleSnd = idleInst
+			idleOk = true
+			idleSnd.Looped = true
+			idleSnd.Volume = 0
 		else
-			warnMissingAudioLayer("Idle")
+			warnMissingSnd("Idle")
 		end
 
 		if revInst and revInst:IsA("Sound") then
-			audioRevSound = revInst
-			audioRevValid = true
-			audioRevSound.Looped = true
-			audioRevSound.Volume = 0
-			audioRevSound.PlaybackSpeed = AUDIO_CONFIG.Rev.minPlayback
+			revSnd = revInst
+			revOk = true
+			revSnd.Looped = true
+			revSnd.Volume = 0
+			revSnd.PlaybackSpeed = SND_CFG.Rev.minPlayback
 		else
-			warnMissingAudioLayer("Rev")
+			warnMissingSnd("Rev")
 		end
 
 		if whineInst and whineInst:IsA("Sound") then
-			audioWhineSound = whineInst
-			audioWhineValid = true
-			audioWhineSound.Looped = true
-			audioWhineSound.Volume = 0
-			audioWhineSound.PlaybackSpeed = AUDIO_CONFIG.Whine.minPlayback
+			whineSnd = whineInst
+			whineOk = true
+			whineSnd.Looped = true
+			whineSnd.Volume = 0
+			whineSnd.PlaybackSpeed = SND_CFG.Whine.minPlayback
 		else
-			warnMissingAudioLayer("Whine")
+			warnMissingSnd("Whine")
 		end
 	end
 
-	-- Starts playback (if not already playing) and snaps the smoothed audio
-	-- state to the current engine state so there's no pop/jump on entry.
-	local function startAudio()
-		audioFadingOut = false
-		audioFadeOutTimer = 0
-		audioStopped = false
+	local function startSnd()
+		fadingOut = false
+		fadeTimer = 0
+		sndStopped = false
 
-		audioRPM = fakeRpm
-		audioThrottle = throttleValue.Value
-		audioLoad = 0
-		audioWhineSpeed = 0
-		audioPrevCarSpeed = 0
-		audioPrevGear = gear
-		audioShiftTimer = 0
+		aRpm = fakeRpm
+		aThr = throttleValue.Value
+		aLoad = 0
+		aWhineSpd = 0
+		prevSpd = 0
+		prevGear = gear
+		shiftTimer = 0
 
-		if audioIdleValid and not audioIdleSound.IsPlaying then
-			audioIdleSound.Volume = 0
-			audioIdleSound:Play()
+		if idleOk and not idleSnd.IsPlaying then
+			idleSnd.Volume = 0
+			idleSnd:Play()
 		end
 
-		if audioRevValid and not audioRevSound.IsPlaying then
-			audioRevSound.Volume = 0
-			audioRevSound:Play()
+		if revOk and not revSnd.IsPlaying then
+			revSnd.Volume = 0
+			revSnd:Play()
 		end
 
-		if audioWhineValid and not audioWhineSound.IsPlaying then
-			audioWhineSound.Volume = 0
-			audioWhineSound:Play()
+		if whineOk and not whineSnd.IsPlaying then
+			whineSnd.Volume = 0
+			whineSnd:Play()
 		end
 	end
 
-	-- Begins a smooth fade-to-silence; the real Stop() happens once the
-	-- fade window elapses (handled in updateAudio) so we don't cut audio
-	-- off abruptly the moment the player exits.
-	local function beginAudioFadeOut()
-		if audioStopped then
+	local function beginFade()
+		if sndStopped then
 			return
 		end
-		audioFadingOut = true
-		audioFadeOutTimer = AUDIO_CONFIG.FadeOutTime
+		fadingOut = true
+		fadeTimer = SND_CFG.FadeOutTime
 	end
 
-	-- Immediate, hard stop -- used on vehicle destruction/cleanup.
-	local function stopAudioImmediate()
-		audioFadingOut = false
-		audioFadeOutTimer = 0
-		audioStopped = true
+	local function stopSndNow()
+		fadingOut = false
+		fadeTimer = 0
+		sndStopped = true
 
-		if audioIdleValid then
-			audioIdleSound:Stop()
-			audioIdleSound.Volume = 0
+		if idleOk then
+			idleSnd:Stop()
+			idleSnd.Volume = 0
 		end
-		if audioRevValid then
-			audioRevSound:Stop()
-			audioRevSound.Volume = 0
+		if revOk then
+			revSnd:Stop()
+			revSnd.Volume = 0
 		end
-		if audioWhineValid then
-			audioWhineSound:Stop()
-			audioWhineSound.Volume = 0
+		if whineOk then
+			whineSnd:Stop()
+			whineSnd.Volume = 0
 		end
 	end
 
-	-- Called every step(dt), whether or not the player is currently driving,
-	-- so a fade-out can finish smoothly after the player exits the car.
-	local function updateAudio(dt, throttle, clutch, currentGear, gearRatio, finalDrive, carSpeedFront, wheelRadius)
-		if audioStopped and not driving then
+	local function updateSnd(dt, throttle, clutch, currentGear, gearRatio, finalDrive, carSpeedFront, wheelRadius)
+		if sndStopped and not driving then
 			return
 		end
 
-		if not driving and not audioFadingOut and not audioStopped then
-			beginAudioFadeOut()
+		if not driving and not fadingOut and not sndStopped then
+			beginFade()
 		end
 
-		-- ---- gear-change (shift) detection -----------------------------
-		-- Drives a brief "clutch disengagement" dip on the Rev layer so
-		-- shifts don't read as an instant volume jump.
-		if currentGear ~= audioPrevGear then
-			audioShiftTimer = AUDIO_CONFIG.ShiftReactionTime
-			audioPrevGear = currentGear
-		elseif audioShiftTimer > 0 then
-			audioShiftTimer = math.max(0, audioShiftTimer - dt)
+		if currentGear ~= prevGear then
+			shiftTimer = SND_CFG.ShiftReactionTime
+			prevGear = currentGear
+		elseif shiftTimer > 0 then
+			shiftTimer = math.max(0, shiftTimer - dt)
 		end
 
-		-- ---- smoothed base signals --------------------------------------
-		-- audioRPM tracks the existing fakeRpm quickly (it's already smoothed
-		-- upstream, so this just removes any last per-frame edges for audio).
-		audioRPM = audioSmooth(audioRPM, fakeRpm, AUDIO_CONFIG.Rev.rpmSmoothing, dt)
-		audioThrottle = audioSmooth(audioThrottle, math.clamp(throttle, 0, 1), AUDIO_CONFIG.Throttle.smoothing, dt)
+		aRpm = smoothTo(aRpm, fakeRpm, SND_CFG.Rev.rpmSmoothing, dt)
+		aThr = smoothTo(aThr, math.clamp(throttle, 0, 1), SND_CFG.Throttle.smoothing, dt)
 
-		-- Engine load: how "connected" and "worked" the engine currently is.
-		-- High when throttle is applied AND the clutch is engaged (coupled to
-		-- the drivetrain); reduced in neutral (nothing to push against) and
-		-- while the clutch is disengaged (free-revving).
 		local couplingFactor = 1 - math.clamp(clutch, 0, 1)
 		local neutralFactor = if currentGear == 0 then 0.3 else 1
 		local rawLoad = math.clamp(throttle, 0, 1) * couplingFactor * neutralFactor
-		audioLoad = audioSmooth(audioLoad, rawLoad, AUDIO_CONFIG.Load.smoothing, dt)
+		aLoad = smoothTo(aLoad, rawLoad, SND_CFG.Load.smoothing, dt)
 
-		-- Drivetrain / gearbox-whine "speed" proxy: wheel rotational speed
-		-- scaled by the current gear ratio and final drive, per the design
-		-- brief (wheel speed x gear ratio x final drive). Falls back to a
-		-- flat 1:1 ratio in neutral so the whine still tracks road speed.
 		local radius = math.max(wheelRadius, 0.1)
 		local wheelAngularSpeed = math.abs(carSpeedFront) / radius
 		local ratioForWhine = if gearRatio ~= 0 then math.abs(gearRatio) else 1
-		local rawDriveSpeed = wheelAngularSpeed * ratioForWhine * finalDrive * AUDIO_CONFIG.Whine.driveSpeedScale
-		audioWhineSpeed = audioSmooth(audioWhineSpeed, rawDriveSpeed, AUDIO_CONFIG.Whine.smoothing, dt)
+		local rawDriveSpeed = wheelAngularSpeed * ratioForWhine * finalDrive * SND_CFG.Whine.driveSpeedScale
+		aWhineSpd = smoothTo(aWhineSpd, rawDriveSpeed, SND_CFG.Whine.smoothing, dt)
 
-		-- Acceleration, used as a small extra "under load" cue for the Rev
-		-- layer (hard launches/accel sound a touch more aggressive than a
-		-- static high-throttle hold at the same RPM).
-		local carAccel = (carSpeedFront - audioPrevCarSpeed) / math.max(dt, 1 / 240)
-		audioPrevCarSpeed = carSpeedFront
+		local carAccel = (carSpeedFront - prevSpd) / math.max(dt, 1 / 240)
+		prevSpd = carSpeedFront
 		local accelFactor = math.clamp(carAccel / 25, -1, 1)
 
 		if not driving then
-			-- While exiting/fading, relax every target toward "engine off"
-			-- instead of holding the last driven state.
-			audioThrottle = audioSmooth(audioThrottle, 0, AUDIO_CONFIG.Throttle.smoothing, dt)
-			audioLoad = audioSmooth(audioLoad, 0, AUDIO_CONFIG.Load.smoothing, dt)
+			aThr = smoothTo(aThr, 0, SND_CFG.Throttle.smoothing, dt)
+			aLoad = smoothTo(aLoad, 0, SND_CFG.Load.smoothing, dt)
 		end
 
-		-- ---- Idle layer ---------------------------------------------------
-		-- Strong at/near idle RPM, fades out (but never fully to 0) as RPM
-		-- climbs into the Rev layer's range.
-		local idleCfg = AUDIO_CONFIG.Idle
-		local idleFadeAlpha = math.clamp((audioRPM - idleCfg.minRPM) / math.max(idleCfg.maxRPM - idleCfg.minRPM, 1), 0, 1)
-		local idleTargetVolume = audioLerp(idleCfg.maxVolume, idleCfg.minVolume, idleFadeAlpha)
+		local idleCfg = SND_CFG.Idle
+		local idleFadeAlpha = math.clamp((aRpm - idleCfg.minRPM) / math.max(idleCfg.maxRPM - idleCfg.minRPM, 1), 0, 1)
+		local idleTargetVolume = mix(idleCfg.maxVolume, idleCfg.minVolume, idleFadeAlpha)
 		if not driving then
 			idleTargetVolume = 0
 		end
-		audioIdleVolume = audioSmooth(audioIdleVolume, idleTargetVolume, idleCfg.smoothing, dt)
+		idleVol = smoothTo(idleVol, idleTargetVolume, idleCfg.smoothing, dt)
 
-		-- ---- Rev layer ------------------------------------------------------
-		local revCfg = AUDIO_CONFIG.Rev
-		local revPlayback = rpmToPlayback(audioRPM, revCfg.minRPM, revCfg.maxRPM, revCfg.minPlayback, revCfg.maxPlayback, revCfg.playbackCurve)
-		-- Subtle extra pitch under hard positive load/acceleration, not a
-		-- second RPM source -- just a small acoustic "strain" cue.
-		revPlayback *= (1 + math.max(accelFactor, 0) * audioLoad * revCfg.accelPlaybackBoost)
+		local revCfg = SND_CFG.Rev
+		local revPlayback = rpmToRate(aRpm, revCfg.minRPM, revCfg.maxRPM, revCfg.minPlayback, revCfg.maxPlayback, revCfg.playbackCurve)
+		revPlayback *= (1 + math.max(accelFactor, 0) * aLoad * revCfg.accelPlaybackBoost)
 
-		local rpmPresence = math.clamp((audioRPM - revCfg.minRPM) / math.max(revCfg.maxRPM - revCfg.minRPM, 1), 0, 1)
-		local throttleLoadPresence = math.clamp(audioThrottle * 0.45 + audioLoad * 0.55, 0, 1)
-		local revTargetVolume = audioLerp(revCfg.baseVolume, revCfg.maxVolume, math.clamp(rpmPresence * 0.55 + throttleLoadPresence * 0.65, 0, 1))
-		revTargetVolume += audioLoad * revCfg.loadVolumeBoost
+		local rpmPresence = math.clamp((aRpm - revCfg.minRPM) / math.max(revCfg.maxRPM - revCfg.minRPM, 1), 0, 1)
+		local throttleLoadPresence = math.clamp(aThr * 0.45 + aLoad * 0.55, 0, 1)
+		local revTargetVolume = mix(revCfg.baseVolume, revCfg.maxVolume, math.clamp(rpmPresence * 0.55 + throttleLoadPresence * 0.65, 0, 1))
+		revTargetVolume += aLoad * revCfg.loadVolumeBoost
 		revTargetVolume = math.clamp(revTargetVolume, 0, revCfg.maxVolume)
 
-		-- Shift "clutch disengagement" dip: briefly pull the Rev volume down
-		-- right after a gear change, then let normal smoothing bring it back
-		-- up naturally as the clutch reconnects -- no hard cut, no re-Play().
-		if audioShiftTimer > 0 then
-			local dipAlpha = audioShiftTimer / AUDIO_CONFIG.ShiftReactionTime
-			revTargetVolume *= (1 - AUDIO_CONFIG.ShiftDipStrength * dipAlpha)
+		if shiftTimer > 0 then
+			local dipAlpha = shiftTimer / SND_CFG.ShiftReactionTime
+			revTargetVolume *= (1 - SND_CFG.ShiftDipStrength * dipAlpha)
 		end
 
 		if not driving then
 			revTargetVolume = 0
 		end
 
-		audioRevVolume = audioSmooth(audioRevVolume, revTargetVolume, revCfg.smoothing, dt)
+		revVol = smoothTo(revVol, revTargetVolume, revCfg.smoothing, dt)
 
-		-- ---- Whine (gearbox) layer -----------------------------------------
-		local whineCfg = AUDIO_CONFIG.Whine
-		local whineAlpha = math.clamp((audioWhineSpeed - whineCfg.minSpeed) / math.max(whineCfg.maxSpeed - whineCfg.minSpeed, 1), 0, 1)
-		local whinePlayback = audioLerp(whineCfg.minPlayback, whineCfg.maxPlayback, whineAlpha)
+		local whineCfg = SND_CFG.Whine
+		local whineAlpha = math.clamp((aWhineSpd - whineCfg.minSpeed) / math.max(whineCfg.maxSpeed - whineCfg.minSpeed, 1), 0, 1)
+		local whinePlayback = mix(whineCfg.minPlayback, whineCfg.maxPlayback, whineAlpha)
 
-		local whineTargetVolume = audioLerp(whineCfg.baseVolume, whineCfg.maxVolume, whineAlpha)
-		whineTargetVolume += audioLoad * whineCfg.loadVolume
-		-- Whine drops off (but doesn't vanish) while the clutch is pressed --
-		-- the output shaft is still spinning with the wheels, just less
-		-- driven, so some mechanical noise remains.
+		local whineTargetVolume = mix(whineCfg.baseVolume, whineCfg.maxVolume, whineAlpha)
+		whineTargetVolume += aLoad * whineCfg.loadVolume
 		whineTargetVolume *= (1 - math.clamp(clutch, 0, 1) * whineCfg.clutchRelease)
 		whineTargetVolume = math.clamp(whineTargetVolume, 0, whineCfg.maxVolume)
 
@@ -1358,29 +1288,27 @@ function UnifiedCarHandler:HandleCar(car)
 			whineTargetVolume = 0
 		end
 
-		audioWhineVolume = audioSmooth(audioWhineVolume, whineTargetVolume, whineCfg.smoothing, dt)
+		whineVol = smoothTo(whineVol, whineTargetVolume, whineCfg.smoothing, dt)
 
-		-- ---- apply to Sound instances ---------------------------------------
-		if audioIdleValid then
-			audioIdleSound.Volume = audioIdleVolume
+		if idleOk then
+			idleSnd.Volume = idleVol
 		end
 
-		if audioRevValid then
-			audioRevSound.Volume = audioRevVolume
-			audioRevSound.PlaybackSpeed = revPlayback
+		if revOk then
+			revSnd.Volume = revVol
+			revSnd.PlaybackSpeed = revPlayback
 		end
 
-		if audioWhineValid then
-			audioWhineSound.Volume = audioWhineVolume
-			audioWhineSound.PlaybackSpeed = whinePlayback
+		if whineOk then
+			whineSnd.Volume = whineVol
+			whineSnd.PlaybackSpeed = whinePlayback
 		end
 
-		-- ---- finish fade-out, then hard stop to free resources -------------
-		if audioFadingOut then
-			audioFadeOutTimer -= dt
-			local allSilent = audioIdleVolume < 0.01 and audioRevVolume < 0.01 and audioWhineVolume < 0.01
-			if audioFadeOutTimer <= 0 or allSilent then
-				stopAudioImmediate()
+		if fadingOut then
+			fadeTimer -= dt
+			local allSilent = idleVol < 0.01 and revVol < 0.01 and whineVol < 0.01
+			if fadeTimer <= 0 or allSilent then
+				stopSndNow()
 			end
 		end
 	end
@@ -1415,7 +1343,7 @@ function UnifiedCarHandler:HandleCar(car)
 		humanoid = nil
 		rootPart = nil
 
-		beginAudioFadeOut()
+		beginFade()
 
 		if alive and prompt.Parent then
 			prompt.Enabled = true
@@ -1452,7 +1380,7 @@ function UnifiedCarHandler:HandleCar(car)
 		releaseControls(false)
 
 		Hud.SetVisible(true)
-		startAudio()
+		startSnd()
 
 		diedConnection = currentHumanoid.Died:Connect(leaveCar)
 	end
@@ -1489,7 +1417,7 @@ function UnifiedCarHandler:HandleCar(car)
 
 		alive = false
 
-		stopAudioImmediate()
+		stopSndNow()
 
 		for _, connection in connections do
 			connection:Disconnect()
@@ -1570,7 +1498,6 @@ function UnifiedCarHandler:HandleCar(car)
 		local totalRatio = gearRatio * transmission.final_drive
 		local inGear = totalRatio ~= 0
 
-		-- ---- Fake RPM (display/sound only — never feeds physics) ----
 		if gear ~= lastRpmGear then
 			fakeRpm = math.max(FAKE_ENGINE.idleRpm, fakeRpm - FAKE_ENGINE.shiftDrop)
 			lastRpmGear = gear
@@ -1578,12 +1505,9 @@ function UnifiedCarHandler:HandleCar(car)
 
 		local rpmTarget
 		if clutch > 0.9 or gear == 0 then
-			-- clutch in / neutral: RPM just follows throttle, free-revving
 			rpmTarget = FAKE_ENGINE.idleRpm + (FAKE_ENGINE.redlineRpm - FAKE_ENGINE.idleRpm) * throttle
 		else
-			-- in gear: blend throttle with road speed so it still *feels* connected
-			-- to how fast you're going, with no real coupling underneath
-			local speedFactor = math.clamp(math.abs(carSpeedFront) / 40, 0, 1) -- tune 40 to your top speed
+			local speedFactor = math.clamp(math.abs(carSpeedFront) / 40, 0, 1)
 			local blend = math.clamp(throttle * 0.7 + speedFactor * 0.5, 0, 1)
 			rpmTarget = FAKE_ENGINE.idleRpm + (FAKE_ENGINE.redlineRpm - FAKE_ENGINE.idleRpm) * blend
 		end
@@ -1598,17 +1522,11 @@ function UnifiedCarHandler:HandleCar(car)
 		fakeRpm = math.clamp(fakeRpm, FAKE_ENGINE.idleRpm, FAKE_ENGINE.redlineRpm)
 		car:SetAttribute("RPM", fakeRpm)
 
-		-- ---- Fake acceleration (this is what actually moves the car) ----
 		local gearForce = GEAR_ACCEL_FORCE[gear] or 0
-		local driveInput = gearForce * throttle * (1 - clutch)
+		local powerFactor = gearPower(gear, carSpeedFront)
+		local driveInput = gearForce * throttle * (1 - clutch) * powerFactor
 
-		local drivenSpeed = carSpeedFront + driveInput * 1.4 -- tune 1.4 for punchiness
-
-		-- Blend "coupled to the engine" (clutch up) with "free-rolling with the
-		-- ground" (clutch down), then bleed the result toward 0 as the brake is
-		-- applied. The wheel speed now always tracks real velocity instead of
-		-- snapping to 0 whenever clutch/brake/throttle happened to combine that way.
-		local wheelSpeed = ((drivenSpeed * (1 - clutch)) + carSpeedFront) * (1 - brake)
+		local wheelSpeed = (carSpeedFront + driveInput * 1.4) * (1 - brake)
 
 		for _, attribute in WHEEL_SPEED_ATTRIBUTES do
 			car:SetAttribute(attribute, wheelSpeed)
@@ -1630,10 +1548,7 @@ function UnifiedCarHandler:HandleCar(car)
 			})
 		end
 
-		-- ============================================================
-		-- DYNAMIC VEHICLE AUDIO -- driven from the same per-frame values
-		-- ============================================================
-		updateAudio(dt, throttle, clutch, gear, gearRatio, transmission.final_drive, carSpeedFront, wheelRadius)
+		updateSnd(dt, throttle, clutch, gear, gearRatio, transmission.final_drive, carSpeedFront, wheelRadius)
 
 		local tireEnd = car:GetAttribute("tireend")
 
@@ -1641,9 +1556,9 @@ function UnifiedCarHandler:HandleCar(car)
 			local speedAttribute = WHEEL_SPEED_ATTRIBUTES[wheel.Name]
 
 			if speedAttribute then
-				local tireInfo = TireSimulation.Update(car, wheel, raycastParams)
+				local tireInfo = TireSim.Update(car, wheel, raycastParams)
 				if tireInfo then
-					FrictionSimulation.Update(tireInfo)
+					FrictionSim.Update(tireInfo)
 				end
 
 				local roll = wheel.Roll
@@ -1712,7 +1627,7 @@ function UnifiedCarHandler:HandleCar(car)
 
 	track(car.Destroying:Connect(destroy))
 
-	initAudio()
+	initSnd()
 
 	task.delay(CONFIG.StartDelay, function()
 		if not alive then
