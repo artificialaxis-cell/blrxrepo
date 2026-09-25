@@ -719,6 +719,11 @@ local RenameTable = {
 		"TIRESTART_3",
 		"TIRESTART_4"
 	},
+	["SpinAtt"] = {
+		"SpinAtt_2",
+		"SpinAtt_3",
+		"SpinAtt_4"
+	},
 }
 
 local function RenameClones(parent)
