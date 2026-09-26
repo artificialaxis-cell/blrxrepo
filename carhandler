@@ -870,8 +870,8 @@ function UnifiedCarHandler:HandleCar(car)
 	local steerSlide = parts.steerSlide
 
 	local raycastParams = RaycastParams.new()
-	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
-	raycastParams.FilterDescendantsInstances = { car }
+	raycastParams.FilterType = Enum.RaycastFilterType.Include
+	raycastParams.FilterDescendantsInstances = { workspace.Map,workspace.Built }
 
 	local alive = true
 	local driving = false
