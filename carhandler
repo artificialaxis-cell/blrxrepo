@@ -27,7 +27,7 @@ local CONFIG = {
 	AutoFirstGearOnEnter = true,
 	StudsToMeters = 0.28,
 }
-local STALL_FACTOR = 0.1
+local STALL_FACTOR = 0.8
 
 local GEAR_ENVELOPE = {
 	[-1] = { PeakSpeed = 15,  MaxSpeed = 58 },
@@ -136,21 +136,7 @@ end
 
 local function gearPower(gear, forwardSpeed)
 	local envelope = GEAR_ENVELOPE[gear]
-	if not envelope then
-		return 1
-	end
-
-	local speed = math.abs(forwardSpeed)
-
-	if speed <= envelope.PeakSpeed then
-		local t = speed / math.max(envelope.PeakSpeed, 0.01)
-		return lerp(STALL_FACTOR, 1, t)
-	elseif speed <= envelope.MaxSpeed then
-		local t = (speed - envelope.PeakSpeed) / math.max(envelope.MaxSpeed - envelope.PeakSpeed, 0.01)
-		return lerp(1, 0, t)
-	else
-		return 0
-	end
+	return 1
 end
 
 local function getContactPoint(tire, origin, rayLength, raycastParams)
