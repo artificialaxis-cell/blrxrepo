@@ -1010,11 +1010,11 @@ function UnifiedCarHandler:HandleCar(car)
 		[-1] = -70,
 		[0]  = 0,
 		[1]  = 130,
-		[2]  = 158,
-		[3]  = 173,
-		[4]  = 189,
-		[5]  = 197,
-		[6]  = 205,
+		[2]  = 100,
+		[3]  = 90,
+		[4]  = 85,
+		[5]  = 54,
+		[6]  = 38,
 	}
 
 	local fakeRpm = FAKE_ENGINE.idleRpm
