@@ -1023,12 +1023,12 @@ function UnifiedCarHandler:HandleCar(car)
 	local GEAR_ACCEL_FORCE = {
 		[-1] = -70,
 		[0]  = 0,
-		[1]  = 100,
-		[2]  = 82,
-		[3]  = 68,
-		[4]  = 56,
-		[5]  = 46,
-		[6]  = 38,
+		[1]  = 130,
+		[2]  = 158,
+		[3]  = 173,
+		[4]  = 189,
+		[5]  = 197,
+		[6]  = 205,
 	}
 
 	local fakeRpm = FAKE_ENGINE.idleRpm
