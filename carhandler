@@ -1703,7 +1703,7 @@ function UnifiedCarHandler:HandleCar(car)
 
 				local joint = findLimbJoint(character, limbName)
 				if joint then
-					joint.Enabled = false
+					joint:Destroy()
 					table.insert(replicationJoints, joint)
 				else
 					warn(string.format("UnifiedCarHandler: no Motor6D found for limb '%s' -- it may fight the replicated CFrame", limbName))
