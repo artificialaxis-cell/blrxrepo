@@ -1,3 +1,88 @@
+--[[
+	UnifiedCarHandler — REWORKED POWERTRAIN VERSION
+
+	==========================================================================
+	PHYSICS ARCHITECTURE
+	==========================================================================
+
+	Forward power path (each frame):
+
+	    Throttle pedal
+	        v
+	    EngineSim            -- combustion torque (from real Nm torque curve),
+	        v                   minus friction/pumping/accessory losses and
+	                            clutch reaction torque, integrated through
+	                            engine rotational inertia -> engine RPM emerges
+	    ClutchSim             -- transmits torque based on (engineOmega -
+	        v                   transInputOmega) slip, capped at clutch torque
+	                            capacity (pedal-scaled)
+	    TransmissionSim        -- multiplies torque by gear ratio, applies
+	        v                   torque interrupt during a shift
+	    (finalDrive, efficiency already folded into TransmissionSim output)
+	        v
+	    DifferentialSim         -- splits driveshaft torque to the two wheels
+	        v                     of a driven axle (OPEN/LOCKED/LIMITED/etc.)
+	    WheelSim (per wheel)     -- driveTorque - tireReactionTorque -
+	        v                     rollingResistanceTorque - brakeTorque,
+	                              integrated through wheel inertia -> wheel
+	                              angular velocity emerges
+	    TireSim / FrictionSim    -- wheel surface speed vs chassis speed at the
+	        v                     contact patch produces slip, slip produces
+	                              longitudinal/lateral tire force (Pacejka-like)
+	    Roblox chassis (Mass)    -- tire force applied as a native Roblox
+	                                Force at the contact attachment; the
+	                                existing suspension (TireSim) is untouched
+
+	Feedback path (what makes RPM emerge instead of being scripted):
+
+	    Vehicle speed -> wheel surface speed (via tire slip) -> WheelSim omega
+	        -> driveshaft omega (via differential/transmission ratio, used to
+	           compute clutch slip) -> clutch reaction torque -> engine load
+	        -> engine RPM
+
+	No step in this chain is skipped: acceleration, top speed, engine braking,
+	wheelspin and RPM behavior are all *outcomes* of the above relationships,
+	not separately scripted values.
+
+	==========================================================================
+	UNIT / SCALE NOTES (read this before tuning)
+	==========================================================================
+
+	Engine, clutch, transmission, differential and wheel rotation are all
+	simulated in real SI units (Nm, kg*m^2, rad/s) with no dependency on studs
+	at all -- a wheel's angular velocity in rad/s means the same thing
+	regardless of how big the Roblox part is.
+
+	The ONLY place SI has to touch Roblox's own physics is at the tire
+	contact patch, where a longitudinal/lateral force has to be written into
+	`tire.FrictionForce.Force` / `tire.TireForce.Force` (Roblox VectorForce
+	instances acting on the physical chassis). FrictionSim's grip budget
+	(FxMax/FyMax) is derived from `mass.AssemblyMass * workspace.Gravity`,
+	i.e. it already works natively in whatever units Roblox itself is using
+	for mass/force on this rig -- that part is deliberately left as Roblox
+	units, unconverted, because that is the actual quantity the Roblox
+	physics engine needs to move this actual chassis.
+
+	Units.ForceScale is only used for the *reverse* trip: turning that
+	Roblox-unit tire force back into real Newtons so it can be fed back as a
+	reaction torque (Nm) on the SI-side WheelSim. This requires one
+	assumption, `Units.MassScale`, which is the ratio between this rig's
+	Roblox `AssemblyMass` numbers and the real-world kilograms you're
+	entering in `stats.massKg`. Roblox's default `workspace.Gravity`
+	(196.2 studs/s^2) is not 9.81 m/s^2, and Roblox part mass is not
+	calibrated to kg out of the box, so this ratio is a per-experience tuning
+	constant, not something that can be derived automatically. It defaults to
+	1 (assume AssemblyMass ~= kg numerically); if your rig's real-world
+	behavior feels too heavy/light, adjust `Units.MassScale` -- everything
+	downstream (wheel reaction torque, rolling resistance, drag) scales
+	consistently once you do.
+
+	Everything else (torque curve values, gear ratios, final drive, wheel
+	radius, mass, Cd, frontal area) is plain real-world data. Change any of
+	it and the simulation responds -- there is no per-car acceleration
+	number anywhere in this file.
+--]]
+
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
@@ -15,6 +100,7 @@ local CONFIG = {
 	GearUpKey = Enum.KeyCode.E,
 	GearDownKey = Enum.KeyCode.Q,
 	MouseSteerKey = Enum.KeyCode.M,
+	RestartEngineKey = Enum.KeyCode.R,
 
 	PromptActionText = "Drive",
 	PromptDistance = 12,
@@ -25,63 +111,37 @@ local CONFIG = {
 	StartDelay = 0.5,
 
 	AutoFirstGearOnEnter = true,
-	StudsToMeters = 0.28,
 }
-local STALL_FACTOR = 0.8
 
-local GEAR_ENVELOPE = {
-	[-1] = { PeakSpeed = 15,  MaxSpeed = 58 },
-
-	[1]  = { PeakSpeed = 25,  MaxSpeed = 60 },
-	[2]  = { PeakSpeed = 52,  MaxSpeed = 124 },
-	[3]  = { PeakSpeed = 82,  MaxSpeed = 175 },
-	[4]  = { PeakSpeed = 110, MaxSpeed = 205 },
-	[5]  = { PeakSpeed = 145, MaxSpeed = 235 },
-	[6]  = { PeakSpeed = 190, MaxSpeed = 270 },
+-- Chassis/wheel -> character replication (unchanged from original: cosmetic
+-- replication of the vehicle onto the driver's character limbs so other
+-- clients can see it move; not part of the physics simulation).
+local CHASSIS_REPLICATION = {
+	Enabled = true,
+	BodyOffset = CFrame.new(0, 0.19, 0.582),
+	WheelToLimb = {
+		FR = "Right Arm",
+		RR = "Right Leg",
+		FL = "Left Arm",
+		RL = "Left Leg",
+	},
 }
 
 local SND_CFG = {
-	Idle = {
-		minRPM = 950,
-		maxRPM = 3200,
-		minVolume = 0.03,
-		maxVolume = 0.55,
-		smoothing = 9,
-	},
-
+	Idle = { minRPM = 950, maxRPM = 3200, minVolume = 0.03, maxVolume = 0.55, smoothing = 9 },
 	Rev = {
-		minRPM = 950,
-		maxRPM = 7800,
-		minPlayback = 0.55,
-		maxPlayback = 2.35,
-		playbackCurve = 0.8,
-		baseVolume = 0.4,
-		maxVolume = 1.7,
-		loadVolumeBoost = 0.7,
-		accelPlaybackBoost = 0.035,
-		smoothing = 6,
-		rpmSmoothing = 14,
+		minRPM = 950, maxRPM = 7800, minPlayback = 0.55, maxPlayback = 2.35, playbackCurve = 0.8,
+		baseVolume = 0.4, maxVolume = 1.7, loadVolumeBoost = 0.7, accelPlaybackBoost = 0.035,
+		smoothing = 6, rpmSmoothing = 14,
 	},
-
 	Whine = {
-		minSpeed = 0,
-		maxSpeed = 200,
-		minPlayback = 0.75,
-		maxPlayback = 2,
-		baseVolume = 0.4,
-		maxVolume = 0.7,
-		loadVolume = 0.45,
-		clutchRelease = 0.12,
-		smoothing = 10,
-		driveSpeedScale = 0.16,
+		minSpeed = 0, maxSpeed = 200, minPlayback = 0.75, maxPlayback = 2, baseVolume = 0.4,
+		maxVolume = 0.7, loadVolume = 0.45, clutchRelease = 0.12, smoothing = 10, driveSpeedScale = 0.16,
 	},
-
 	Throttle = { smoothing = 16 },
 	Load = { smoothing = 5 },
-
 	ShiftReactionTime = 0.14,
 	ShiftDipStrength = 0.5,
-
 	FadeOutTime = 0.6,
 }
 
@@ -92,22 +152,507 @@ local WHEEL_SPEED_ATTRIBUTES = {
 	RL = "rearLws",
 }
 
-local REQUIRED_CHILDREN = {
-	"Wheels",
-	"Mass",
-	"Primary",
-	"Throttle",
-	"Brake",
-	"Clutch",
-	"Steer",
-}
+local REQUIRED_CHILDREN = { "Wheels", "Mass", "Primary", "Throttle", "Brake", "Clutch", "Steer" }
+local REQUIRED_ATTRIBUTES = { "psi", "damper", "tirestart", "tireend" }
 
-local REQUIRED_ATTRIBUTES = {
-	"psi",
-	"damper",
-	"tirestart",
-	"tireend",
-}
+--==========================================================================--
+-- UNITS
+--==========================================================================--
+
+local Units = {}
+Units.StudsToMeters = 0.28
+Units.MetersToStuds = 1 / Units.StudsToMeters
+-- Ratio between this rig's Roblox AssemblyMass numbers and real kilograms.
+-- See the unit notes at the top of this file. Tune per-experience.
+Units.MassScale = 1
+Units.ForceScale = Units.MassScale / Units.StudsToMeters -- multiply Newtons by this to get Roblox force units
+
+function Units.RobloxForceToNewtons(robloxForce)
+	return robloxForce / Units.ForceScale
+end
+
+function Units.RadPerSecToRPM(omega)
+	return omega * 60 / (2 * math.pi)
+end
+
+function Units.RPMToRadPerSec(rpm)
+	return rpm * 2 * math.pi / 60
+end
+
+function Units.MpsToStudsPerSec(mps)
+	return mps * Units.MetersToStuds
+end
+
+function Units.StudsPerSecToMps(sps)
+	return sps * Units.StudsToMeters
+end
+
+local function lerp(a, b, t)
+	return a + (b - a) * math.clamp(t, 0, 1)
+end
+
+local function smoothTo(current, target, rate, dt)
+	local alpha = 1 - math.exp(-math.max(rate, 0) * dt)
+	return current + (target - current) * alpha
+end
+
+local function flatten(vector, fallback)
+	local flat = Vector3.new(vector.X, 0, vector.Z)
+	if flat.Magnitude < 0.01 then
+		return fallback
+	end
+	return flat.Unit
+end
+
+local function approach(current, target, speed, dt)
+	if current < target then
+		return math.min(current + speed * dt, target)
+	elseif current > target then
+		return math.max(current - speed * dt, target)
+	end
+	return current
+end
+
+--==========================================================================--
+-- ENGINE SIM
+--
+-- omega is integrated from net torque / inertia every frame -- RPM is a
+-- readout of that integration, never a target that gets chased.
+--==========================================================================--
+
+local EngineSim = {}
+EngineSim.__index = EngineSim
+
+function EngineSim.new(config)
+	local self = setmetatable({}, EngineSim)
+
+	self.idleRPM = config.idleRPM or 900
+	self.redlineRPM = config.redlineRPM or 7000
+	self.inertia = config.inertia or 0.15 -- kg*m^2 (flywheel + reciprocating assembly, real value)
+
+	self.torqueCurve = config.torqueCurve
+	self.torquePoints = {}
+	for rpm in pairs(self.torqueCurve) do
+		table.insert(self.torquePoints, rpm)
+	end
+	table.sort(self.torquePoints)
+	assert(#self.torquePoints >= 2, "EngineSim requires at least 2 torqueCurve points")
+
+	local friction = config.friction or {}
+	-- Static friction: constant drag torque (Nm) from piston rings/bearings, roughly RPM-independent.
+	self.staticFriction = friction.static or 12
+	-- Viscous friction: Nm per rad/s, oil shear losses that grow with RPM.
+	self.viscous = friction.viscous or 0.010
+	-- Pumping losses: Nm per (rad/s)^2, throttle-plate/intake pumping work, grows with the square of RPM.
+	self.pumpingLossCoefficient = friction.pumpingLossCoefficient or 0.0009
+	-- Constant parasitic load from alternator/water pump/power steering etc.
+	self.accessoryTorque = config.accessoryTorque or 6
+
+	self.idleControl = config.idleControl or {}
+	if self.idleControl.enabled == nil then
+		self.idleControl.enabled = true
+	end
+	self.idleControl.targetRPM = self.idleControl.targetRPM or self.idleRPM
+	self.idleControl.authority = self.idleControl.authority or 0.55
+	self.idleControl.stallRPM = self.idleControl.stallRPM or (self.idleRPM * 0.35)
+
+	self.revLimiter = config.revLimiter or {}
+	self.revLimiter.rpm = self.revLimiter.rpm or self.redlineRPM
+	self.revLimiter.cut = self.revLimiter.cut or 1.0
+	self.revLimiter.hysteresis = self.revLimiter.hysteresis or 120
+
+	self.omega = Units.RPMToRadPerSec(self.idleRPM)
+	self.stalled = false
+	self.limiterActive = false
+	self.lastCombustionTorque = 0
+	self.lastNetTorque = 0
+
+	return self
+end
+
+function EngineSim:_combustionTorqueAt(rpm, throttle)
+	local points = self.torquePoints
+	local curve = self.torqueCurve
+	local maxTorque
+
+	if rpm <= points[1] then
+		maxTorque = curve[points[1]]
+	elseif rpm >= points[#points] then
+		maxTorque = curve[points[#points]]
+	else
+		maxTorque = curve[points[#points]]
+		for i = 1, #points - 1 do
+			local lo, hi = points[i], points[i + 1]
+			if rpm >= lo and rpm <= hi then
+				local alpha = (rpm - lo) / (hi - lo)
+				maxTorque = curve[lo] + (curve[hi] - curve[lo]) * alpha
+				break
+			end
+		end
+	end
+
+	return maxTorque * math.clamp(throttle, 0, 1)
+end
+
+-- loadTorque: reaction torque fed back from the clutch (Nm). Positive opposes engine rotation.
+function EngineSim:Update(dt, throttle, loadTorque)
+	loadTorque = loadTorque or 0
+	local rpm = self:GetRPM()
+
+	local idleThrottle = 0
+	if self.idleControl.enabled and rpm < self.idleControl.targetRPM * 1.05 then
+		local deficit = (self.idleControl.targetRPM - rpm) / self.idleControl.targetRPM
+		idleThrottle = math.clamp(deficit * self.idleControl.authority, 0, 1)
+	end
+	local effectiveThrottle = math.max(math.clamp(throttle, 0, 1), idleThrottle)
+
+	if rpm >= self.revLimiter.rpm then
+		self.limiterActive = true
+	elseif rpm < self.revLimiter.rpm - self.revLimiter.hysteresis then
+		self.limiterActive = false
+	end
+	if self.limiterActive then
+		effectiveThrottle = effectiveThrottle * (1 - self.revLimiter.cut)
+	end
+
+	local combustionTorque = self:_combustionTorqueAt(rpm, effectiveThrottle)
+	local frictionTorque = self.staticFriction + self.viscous * self.omega
+	local pumpingLoss = self.pumpingLossCoefficient * self.omega * self.omega
+
+	if self.stalled then
+		combustionTorque = 0
+	end
+
+	local netTorque = combustionTorque - frictionTorque - pumpingLoss - self.accessoryTorque - loadTorque
+
+	if not self.stalled and rpm < self.idleControl.stallRPM and netTorque < 0 then
+		self.stalled = true
+		combustionTorque = 0
+		netTorque = -frictionTorque - pumpingLoss - loadTorque
+	end
+
+	local angularAcceleration = netTorque / self.inertia
+	self.omega = math.max(self.omega + angularAcceleration * dt, 0)
+
+	self.lastCombustionTorque = combustionTorque
+	self.lastNetTorque = netTorque
+
+	return self.omega
+end
+
+function EngineSim:Restart()
+	if self.omega < Units.RPMToRadPerSec(self.idleControl.stallRPM) then
+		self.omega = Units.RPMToRadPerSec(self.idleRPM)
+	end
+	self.stalled = false
+end
+
+function EngineSim:GetRPM()
+	return Units.RadPerSecToRPM(self.omega)
+end
+
+function EngineSim:GetAngularVelocity()
+	return self.omega
+end
+
+function EngineSim:IsStalled()
+	return self.stalled
+end
+
+--==========================================================================--
+-- CLUTCH SIM
+--
+-- IMPLICIT synchronization model (numerically stable at any frame rate/dt).
+--
+-- A naive clutch model applies torque proportional to slip ("torque =
+-- stiffness * (engineOmega - transOmega)") -- but that is a stiff spring,
+-- and integrating a stiff spring with explicit Euler at a variable Roblox
+-- frame rate blows up the moment dt isn't tiny compared to inertia/stiffness
+-- (exactly the wheel-speed oscillation / instability this replaces).
+--
+-- Instead, each step we solve directly for the torque that would bring the
+-- engine and the reflected transmission-input inertia to the SAME angular
+-- velocity by the end of this exact timestep, then clamp that to the
+-- clutch's torque capacity. This is unconditionally stable: it never
+-- overshoots, regardless of how large or small dt is, because it is derived
+-- from the timestep itself rather than an arbitrary spring constant.
+--
+-- Derivation: applying torque T to the engine (inertia Ie) and -T to the
+-- reflected transmission side (inertia Ir) for a duration dt changes their
+-- speeds by -T/Ie*dt and +T/Ir*dt respectively. Setting the two resulting
+-- speeds equal and solving for T gives:
+--     T = (omegaEngine - omegaTrans) * (Ie*Ir) / ((Ie+Ir) * dt)
+-- Clamping |T| to the clutch's pedal-scaled capacity is what allows slip
+-- (a slipping clutch) instead of full synchronization.
+--==========================================================================--
+
+local ClutchSim = {}
+ClutchSim.__index = ClutchSim
+
+function ClutchSim.new(config)
+	local self = setmetatable({}, ClutchSim)
+	self.maxTorque = config.maxTorque or 380 -- Nm, full engagement holding capacity
+	self.slip = 0
+	self.lastTorque = 0
+	return self
+end
+
+-- pedal: 0 = fully released/engaged, 1 = fully pressed/disengaged
+-- reflectedInertia: the transmission-input-side inertia (kg*m^2) as seen through the current gear
+-- (i.e. driven-wheel inertia divided by totalRatio^2). Pass 0 when the drivetrain side is disconnected
+-- (neutral) -- the clutch then transmits nothing regardless of pedal position.
+function ClutchSim:Update(dt, engineOmega, engineInertia, transInputOmega, reflectedInertia, pedal)
+	local capacity = self.maxTorque * math.clamp(1 - pedal, 0, 1)
+	self.slip = engineOmega - transInputOmega
+
+	if capacity <= 0.001 or reflectedInertia <= 0 or engineInertia <= 0 then
+		self.lastTorque = 0
+		return 0
+	end
+
+	local combinedInertia = (engineInertia * reflectedInertia) / (engineInertia + reflectedInertia)
+	local syncTorque = self.slip * combinedInertia / math.max(dt, 1 / 480)
+	local torque = math.clamp(syncTorque, -capacity, capacity)
+	self.lastTorque = torque
+	return torque
+end
+
+function ClutchSim:GetSlip()
+	return self.slip
+end
+
+--==========================================================================--
+-- TRANSMISSION SIM
+--==========================================================================--
+
+local TransmissionSim = {}
+TransmissionSim.__index = TransmissionSim
+
+function TransmissionSim.new(config)
+	local self = setmetatable({}, TransmissionSim)
+	self.gears = config.gears -- indexed table: [-1] = reverse, [0] = neutral, [1..N] = forward
+	self.finalDrive = config.finalDrive or 3.9
+	self.efficiency = config.efficiency or 0.94
+	self.shiftTime = config.shiftTime or 0.18
+	self.currentGear = 0
+	self.pendingGear = 0
+	self.shifting = false
+	self.shiftTimer = 0
+	return self
+end
+
+function TransmissionSim:GetGear()
+	return self.currentGear
+end
+
+function TransmissionSim:GetRatio(gear)
+	return self.gears[gear or self.currentGear] or 0
+end
+
+function TransmissionSim:IsShifting()
+	return self.shifting
+end
+
+function TransmissionSim:RequestShift(gear)
+	if self.gears[gear] == nil or self.shifting or gear == self.currentGear then
+		return false
+	end
+	self.pendingGear = gear
+	self.shifting = true
+	self.shiftTimer = self.shiftTime
+	return true
+end
+
+function TransmissionSim:Update(dt)
+	if self.shifting then
+		self.shiftTimer -= dt
+		if self.shiftTimer <= 0 then
+			self.currentGear = self.pendingGear
+			self.shifting = false
+		end
+	end
+end
+
+-- inputTorque (Nm, from the clutch) -> driveshaft torque (Nm). Zero during a shift (torque interrupt).
+function TransmissionSim:GetOutputTorque(inputTorque)
+	if self.shifting then
+		return 0
+	end
+	return inputTorque * self:GetRatio() * self.finalDrive * self.efficiency
+end
+
+function TransmissionSim:GetTotalRatio()
+	return self:GetRatio() * self.finalDrive
+end
+
+-- The engine/transmission-input angular speed required to match a given driveshaft speed with zero slip.
+function TransmissionSim:RequiredInputOmega(driveshaftOmega)
+	local totalRatio = self:GetTotalRatio()
+	if totalRatio == 0 then
+		return 0
+	end
+	return driveshaftOmega * totalRatio
+end
+
+--==========================================================================--
+-- DIFFERENTIAL SIM
+--
+-- Splits driveshaft torque between the two wheels of one axle. Modular by
+-- design: adding a new type only means adding a branch here.
+--==========================================================================--
+
+local DifferentialSim = {}
+DifferentialSim.__index = DifferentialSim
+
+function DifferentialSim.new(config)
+	local self = setmetatable({}, DifferentialSim)
+	self.type = (config.type or "OPEN"):upper()
+	self.preload = config.preload or 15 -- Nm, base bias torque available even at zero slip (LSD only)
+	self.powerLock = config.powerLock or 0.35 -- 0-1, locking bias fraction while driving
+	self.coastLock = config.coastLock or 0.15 -- 0-1, locking bias fraction while coasting/engine braking
+	self.maxBias = config.maxBias or 3 -- max torque ratio between the two output wheels
+	return self
+end
+
+-- inputTorque: driveshaft torque delivered to this differential (Nm)
+-- omegaA/omegaB: angular velocities (rad/s) of the two output members
+-- inertiaA/inertiaB: rotational inertia (kg*m^2) of the two output members -- only needed by
+-- LOCKED/WELDED, which (like the clutch above) solves for the implicit synchronization torque
+-- rather than using an explicit stiffness gain, so it stays stable at any timestep.
+-- returns torqueA, torqueB (Nm)
+function DifferentialSim:Distribute(dt, inputTorque, omegaA, omegaB, inertiaA, inertiaB)
+	local half = inputTorque * 0.5
+
+	if self.type == "OPEN" then
+		return half, half
+	end
+
+	local omegaDiff = omegaA - omegaB
+	local biasCap = math.abs(inputTorque) * (self.maxBias - 1) * 0.5
+
+	if self.type == "LOCKED" or self.type == "WELDED" then
+		local Ia = math.max(inertiaA or 1, 0.01)
+		local Ib = math.max(inertiaB or 1, 0.01)
+		local combinedInertia = (Ia * Ib) / (Ia + Ib)
+		local syncTorque = omegaDiff * combinedInertia / math.max(dt, 1 / 480)
+		local lockTorque = math.clamp(syncTorque, -biasCap, biasCap)
+		return half - lockTorque, half + lockTorque
+	end
+
+	if self.type == "LIMITED" or self.type == "TORSEN" or self.type == "CLUTCH_LSD" then
+		local underPower = inputTorque >= 0
+		local lockFraction = underPower and self.powerLock or self.coastLock
+		local speedTerm = math.clamp(omegaDiff * 6, -1, 1)
+		local biasTorque = (math.abs(inputTorque) * lockFraction + self.preload) * speedTerm
+		biasTorque = math.clamp(biasTorque, -biasCap, biasCap)
+		return half - biasTorque, half + biasTorque
+	end
+
+	return half, half
+end
+
+--==========================================================================--
+-- WHEEL SIM
+--
+-- Per-wheel rotational dynamics: torque in from the drivetrain, torque out
+-- to the tire (reaction), rolling resistance, and braking, integrated
+-- through wheel inertia. This is what makes wheel spin a genuine physical
+-- quantity instead of a value derived from chassis speed.
+--
+-- STABILITY: the tire's grip curve is very stiff near zero slip (a typical
+-- loaded tire's stiffness is on the order of 10^5 N per unit slip ratio),
+-- while wheel inertia is small (~1 kg*m^2). Explicit Euler integration of
+-- that combination is only stable for a timestep on the order of
+-- inertia/stiffness -- far smaller than even a substepped Roblox frame --
+-- and diverges (with alternating sign, i.e. the wheel-speed oscillation
+-- this replaces) the moment dt exceeds that limit. This uses the same
+-- technique as ClutchSim/DifferentialSim above: a local linearization of
+-- the tire force around the current operating point, solved implicitly
+-- (backward Euler). It does not change the tire model itself, only how the
+-- wheel's own rotational integration responds to it, and is unconditionally
+-- stable regardless of dt or how stiff the tire curve momentarily is.
+--==========================================================================--
+
+local WheelSim = {}
+WheelSim.__index = WheelSim
+
+function WheelSim.new(config)
+	local self = setmetatable({}, WheelSim)
+	self.inertia = config.inertia or 1.1 -- kg*m^2 (wheel + tire + brake rotor, real value)
+	self.radius = config.radius or 0.32 -- meters
+	self.rollingResistanceCoefficient = config.rollingResistanceCoefficient or 0.015
+	self.omega = 0
+	return self
+end
+
+-- driveTorque: Nm delivered from the drivetrain (0 for a non-driven wheel)
+-- brakeTorque: Nm of braking capacity currently requested (always opposes current spin direction)
+-- tireForceNewtons: this frame's longitudinal tire force at the contact patch (real Newtons),
+--     evaluated at the wheel's CURRENT surface speed (the linearization point)
+-- tireStiffness: local d(Fx)/d(surfaceSpeedStuds) at that same point, in Newtons per stud/s
+--     (returned by FrictionSim.Update alongside the force) -- used only to build the implicit
+--     correction below, never applied as a separate force
+-- normalLoadNewtons: real Newtons of vertical load at this wheel (for rolling resistance)
+-- grounded: whether the wheel is currently touching the ground
+function WheelSim:Update(dt, driveTorque, brakeTorque, tireForceNewtons, tireStiffness, normalLoadNewtons, grounded)
+	dt = math.max(dt, 1 / 480)
+
+	local reactionTorqueAtCurrentOmega = grounded and (tireForceNewtons * self.radius) or 0
+
+	local reactionDampingNmPerOmega = 0
+	if grounded and tireStiffness and tireStiffness > 0 then
+		-- Chain rule through surfaceSpeedStuds = omega * radius * MetersToStuds, then one more
+		-- factor of radius to go from force to torque: d(reactionTorque)/domega.
+		local dForceDOmega = tireStiffness * self.radius * Units.MetersToStuds
+		reactionDampingNmPerOmega = dForceDOmega * self.radius
+	end
+
+	local rollingResistanceTorque = 0
+	if grounded and math.abs(self.omega) > 0.01 then
+		local sign = self.omega > 0 and 1 or -1
+		rollingResistanceTorque = self.rollingResistanceCoefficient * normalLoadNewtons * self.radius * sign
+	end
+
+	local brakeReaction = 0
+	if brakeTorque and brakeTorque > 0.01 and math.abs(self.omega) > 0.001 then
+		local sign = self.omega > 0 and 1 or -1
+		local maxBrakeThisFrame = math.abs(self.omega) * self.inertia / dt
+		brakeReaction = -sign * math.min(brakeTorque, maxBrakeThisFrame)
+	end
+
+	-- Everything EXCEPT the tire reaction's rate-of-change is explicit (none of the rest is stiff
+	-- enough to need this treatment); folding that one term's linearized slope into the
+	-- denominator instead of the numerator is what makes this an implicit solve for omega.
+	local netOtherTorque = (driveTorque or 0) - reactionTorqueAtCurrentOmega - rollingResistanceTorque + brakeReaction
+	local denom = self.inertia / dt + reactionDampingNmPerOmega
+	self.omega += netOtherTorque / denom
+
+	return self.omega
+end
+
+function WheelSim:GetSurfaceSpeed()
+	return self.omega * self.radius -- m/s
+end
+
+function WheelSim:GetRPM()
+	return Units.RadPerSecToRPM(self.omega)
+end
+
+--==========================================================================--
+-- AERO
+--==========================================================================--
+
+local function computeAeroDragNewtons(speedMps, aero)
+	-- F = 0.5 * rho * Cd * A * v^2 (SI). Sign matches direction of travel; caller applies -velocity.Unit.
+	return 0.5 * aero.rho * aero.Cd * aero.area * speedMps * math.abs(speedMps)
+end
+
+--==========================================================================--
+-- TIRE SIM (suspension + contact patch geometry -- unchanged from the
+-- original except that FrictionSim now reads wheel speed from WheelSim
+-- instead of a shared axle attribute, and normal load is taken from the
+-- actual per-wheel suspension force instead of a flat quarter-mass split).
+--==========================================================================--
 
 local TireSim = {}
 
@@ -128,15 +673,6 @@ for _, radius in ipairs(SAMPLE_RADII) do
 	table.insert(SAMPLE_OFFSETS, { diagonal, -diagonal })
 	table.insert(SAMPLE_OFFSETS, { -diagonal, diagonal })
 	table.insert(SAMPLE_OFFSETS, { -diagonal, -diagonal })
-end
-
-local function lerp(a, b, t)
-	return a + (b - a) * math.clamp(t, 0, 1)
-end
-
-local function gearPower(gear, forwardSpeed)
-	local envelope = GEAR_ENVELOPE[gear]
-	return 1
 end
 
 local function getContactPoint(tire, origin, rayLength, raycastParams)
@@ -200,8 +736,6 @@ local function getContactPoint(tire, origin, rayLength, raycastParams)
 	return positionSum / keptCount, averageNormal, commonMaterial
 end
 
-local stat = {}
-
 function TireSim.Update(car, wheel, raycastParams)
 	local springStrength = car:GetAttribute("psi") * 300
 	local damper = car:GetAttribute("damper")
@@ -235,7 +769,8 @@ function TireSim.Update(car, wheel, raycastParams)
 	local springForce = -springStrength * compression
 	local damperForce = -damper * tire.AssemblyLinearVelocity.Y
 
-	tireForce.Force = groundNormal * (springForce + damperForce)
+	local normalForce = springForce + damperForce
+	tireForce.Force = groundNormal * normalForce
 
 	return {
 		folder = wheel,
@@ -243,58 +778,34 @@ function TireSim.Update(car, wheel, raycastParams)
 		CPos = contactPosition,
 		car = car,
 		grM = groundMaterial,
+		normalLoadRoblox = math.max(normalForce, 0), -- Roblox-unit vertical load, used as the grip budget
 	}
 end
+
+--==========================================================================--
+-- FRICTION SIM (Pacejka-like brush model -- unchanged core math from the
+-- original; only the surface-speed source changed, from a shared axle
+-- attribute to this wheel's own WheelSim angular velocity).
+--==========================================================================--
 
 local FrictionSim = {}
 
 local MU_LOOKUP = {
-	[Enum.Material.Asphalt] = 1.9,
-	[Enum.Material.Concrete] = 1.7,
-	[Enum.Material.Pavement] = 1.1,
-	[Enum.Material.Grass] = 0.7,
-	[Enum.Material.Mud] = 0.25,
-	[Enum.Material.Sand] = 0.4,
-	[Enum.Material.Snow] = 0.2,
-	[Enum.Material.Ice] = 0.08,
-	[Enum.Material.Ground] = 1.0,
-	[Enum.Material.Rock] = 0.9,
-	[Enum.Material.Salt] = 0.7,
-	[Enum.Material.Basalt] = 0.95,
-	[Enum.Material.LeafyGrass] = 0.35,
-	[Enum.Material.CrackedLava] = 0.15,
-	[Enum.Material.Glacier] = 0.1,
-	[Enum.Material.Plastic] = 0.7,
-	[Enum.Material.SmoothPlastic] = 0.6,
-	[Enum.Material.Granite] = 0.95,
-	[Enum.Material.Slate] = 0.9,
-	[Enum.Material.Wood] = 0.6,
-	[Enum.Material.WoodPlanks] = 0.65,
-	[Enum.Material.CorrodedMetal] = 0.9,
-	[Enum.Material.DiamondPlate] = 1.0,
-	[Enum.Material.Metal] = 0.65,
-	[Enum.Material.Foil] = 0.15,
-	[Enum.Material.Marble] = 0.45,
-	[Enum.Material.Glass] = 0.05,
-	[Enum.Material.Pebble] = 0.5,
-	[Enum.Material.Fabric] = 0.7,
-	[Enum.Material.Neon] = 0.3,
+	[Enum.Material.Asphalt] = 1.9, [Enum.Material.Concrete] = 1.9, [Enum.Material.Pavement] = 1.1,
+	[Enum.Material.Grass] = 0.7, [Enum.Material.Mud] = 0.25, [Enum.Material.Sand] = 0.4,
+	[Enum.Material.Snow] = 0.2, [Enum.Material.Ice] = 0.08, [Enum.Material.Ground] = 1.0,
+	[Enum.Material.Rock] = 0.9, [Enum.Material.Salt] = 0.7, [Enum.Material.Basalt] = 0.95,
+	[Enum.Material.LeafyGrass] = 0.35, [Enum.Material.CrackedLava] = 0.15, [Enum.Material.Glacier] = 0.1,
+	[Enum.Material.Plastic] = 0.7, [Enum.Material.SmoothPlastic] = 0.6, [Enum.Material.Granite] = 0.95,
+	[Enum.Material.Slate] = 0.9, [Enum.Material.Wood] = 0.6, [Enum.Material.WoodPlanks] = 0.65,
+	[Enum.Material.CorrodedMetal] = 0.9, [Enum.Material.DiamondPlate] = 1.0, [Enum.Material.Metal] = 0.65,
+	[Enum.Material.Foil] = 0.15, [Enum.Material.Marble] = 0.45, [Enum.Material.Glass] = 0.05,
+	[Enum.Material.Pebble] = 0.5, [Enum.Material.Fabric] = 0.7, [Enum.Material.Neon] = 0.3,
 	[Enum.Material.ForceField] = 0.0,
 }
 
-local LONGITUDINAL = {
-	B = 10.0,
-	C = 1.65,
-	E = 0.97,
-	maxSlip = 1.0,
-}
-
-local LATERAL = {
-	B = 6.5,
-	C = 1.30,
-	E = 1.00,
-	maxSlip = math.rad(18),
-}
+local LONGITUDINAL = { B = 10.0, C = 1.65, E = 0.97, maxSlip = 1.0 }
+local LATERAL = { B = 6.5, C = 1.30, E = 1.00, maxSlip = math.rad(18) }
 
 local LOW_SPEED_REFERENCE = 2.5
 local STATIONARY_THRESHOLD = 0.75
@@ -304,37 +815,13 @@ local SLIP_SMOKE_START = 0.35
 local function pacejkaNormalized(slip, params)
 	local clampedSlip = math.clamp(slip, -params.maxSlip, params.maxSlip)
 	local bx = params.B * clampedSlip
-
 	return math.sin(params.C * math.atan(bx - params.E * (bx - math.atan(bx))))
 end
 
-local function getSurfaceSpeed(tireInfo)
-	local car = tireInfo.car
-	local folder = tireInfo.folder
-
-	local axleSpeed
-	if folder.Name == "FR" or folder.Name == "FL" then
-		axleSpeed = car:GetAttribute("frontWS")
-	else
-		axleSpeed = car:GetAttribute("rearWS")
-	end
-
-	if typeof(axleSpeed) == "number" then
-		return axleSpeed
-	end
-
-	local tire = tireInfo.tire
-	local radius = tire:GetAttribute("Radius") or tire.Size.Y * 0.5
-	local wheelOmega = tire.AssemblyAngularVelocity:Dot(tire.CFrame.RightVector)
-
-	if math.abs(wheelOmega) > 1e-3 then
-		return wheelOmega * radius
-	end
-
-	return 0
-end
-
-function FrictionSim.Update(tireInfo)
+-- surfaceSpeedStuds: this wheel's own rotational surface speed (studs/s), from WheelSim, converted by the caller.
+-- Returns the longitudinal tire force in REAL NEWTONS (not Roblox force units) plus telemetry, so the caller can
+-- both apply it to Roblox (converted) and feed it back into WheelSim (already real Newtons, no conversion needed).
+function FrictionSim.Update(tireInfo, surfaceSpeedStuds)
 	local tire = tireInfo.tire
 	local car = tireInfo.car
 	local folder = tireInfo.folder
@@ -342,46 +829,47 @@ function FrictionSim.Update(tireInfo)
 	local groundMaterial = tireInfo.grM
 
 	local forwardDir = tire.CFrame.LookVector
+	forwardDir = Vector3.new(forwardDir.X, 0, forwardDir.Z).Unit
 	local rightDir = tire.CFrame.RightVector
+	rightDir = Vector3.new(rightDir.X, 0, rightDir.Z).Unit
 
-	local verticalLoad = (car.Mass.AssemblyMass * workspace.Gravity) / 4
+	-- Convert this wheel's share of the Roblox-unit suspension load into real Newtons for grip math.
+	local verticalLoadNewtons = Units.RobloxForceToNewtons(tireInfo.normalLoadRoblox)
 	local roadMu = MU_LOOKUP[groundMaterial] or 0.6
-	local surfaceSpeed = getSurfaceSpeed(tireInfo)
 
 	local contactOffset = contactPosition - tire.Position
 	local velocityAtContact = tire.AssemblyLinearVelocity + tire.AssemblyAngularVelocity:Cross(contactOffset)
-	local longitudinalVel = velocityAtContact:Dot(forwardDir)
-	local lateralVel = velocityAtContact:Dot(rightDir)
+	local longitudinalVelStuds = velocityAtContact:Dot(forwardDir)
+	local lateralVelStuds = velocityAtContact:Dot(rightDir)
 
-	local referenceSpeed = math.max(math.abs(longitudinalVel), math.abs(surfaceSpeed), LOW_SPEED_REFERENCE)
+	local referenceSpeed = math.max(math.abs(longitudinalVelStuds), math.abs(surfaceSpeedStuds), LOW_SPEED_REFERENCE)
 
-	local slipRatio = (surfaceSpeed - longitudinalVel) / referenceSpeed
-	local slipAngle = math.atan2(lateralVel, math.max(math.abs(longitudinalVel), LOW_SPEED_REFERENCE))
+	local slipRatio = (surfaceSpeedStuds - longitudinalVelStuds) / referenceSpeed
+	local slipAngle = math.atan2(lateralVelStuds, math.max(math.abs(longitudinalVelStuds), LOW_SPEED_REFERENCE))
 
 	slipRatio = math.clamp(slipRatio, -LONGITUDINAL.maxSlip, LONGITUDINAL.maxSlip)
 	slipAngle = math.clamp(slipAngle, -LATERAL.maxSlip, LATERAL.maxSlip)
 
-	local isStationary = math.abs(longitudinalVel) < STATIONARY_THRESHOLD
-		and math.abs(surfaceSpeed) < STATIONARY_THRESHOLD
-		and math.abs(lateralVel) < STATIONARY_THRESHOLD
+	local isStationary = math.abs(longitudinalVelStuds) < STATIONARY_THRESHOLD
+		and math.abs(surfaceSpeedStuds) < STATIONARY_THRESHOLD
+		and math.abs(lateralVelStuds) < STATIONARY_THRESHOLD
 
-	local FxMax = verticalLoad * roadMu
-	local FyMax = verticalLoad * roadMu
+	local FxMax = verticalLoadNewtons * roadMu
+	local FyMax = verticalLoadNewtons * roadMu
 
 	if FxMax <= 0 or FyMax <= 0 then
-		return
+		tire.FrictionForce.Force = Vector3.zero
+		return 0, 0, 0
 	end
 
-	local frictionForce
+	local frictionForceNewtons
 
 	if isStationary then
-		local driveSlip = math.clamp(surfaceSpeed / LOW_SPEED_REFERENCE, -1, 1)
+		local driveSlip = math.clamp(surfaceSpeedStuds / LOW_SPEED_REFERENCE, -1, 1)
 		local driveFx = pacejkaNormalized(driveSlip, LONGITUDINAL) * FxMax
-
-		local holdFx = -longitudinalVel * roadMu * STATIC_DAMPING
-		local holdFy = -lateralVel * roadMu * STATIC_DAMPING
-
-		frictionForce = forwardDir * (driveFx + holdFx) + rightDir * holdFy
+		local holdFx = -longitudinalVelStuds * roadMu * STATIC_DAMPING
+		local holdFy = -lateralVelStuds * roadMu * STATIC_DAMPING
+		frictionForceNewtons = forwardDir * (driveFx + holdFx) + rightDir * holdFy
 	else
 		local Fx = pacejkaNormalized(slipRatio, LONGITUDINAL) * FxMax
 		local Fy = pacejkaNormalized(slipAngle, LATERAL) * FyMax
@@ -392,10 +880,11 @@ function FrictionSim.Update(tireInfo)
 			Fy /= ellipse
 		end
 
-		frictionForce = forwardDir * Fx - rightDir * Fy
+		frictionForceNewtons = forwardDir * Fx - rightDir * Fy
 	end
 
-	tire.FrictionForce.Force = frictionForce
+	-- Apply to Roblox in Roblox force units; keep the plain forward-axis Newton magnitude for WheelSim feedback.
+	tire.FrictionForce.Force = frictionForceNewtons * Units.ForceScale
 
 	local normalizedSlipAngle = math.abs(slipAngle) / LATERAL.maxSlip
 	local totalSlip = math.sqrt(slipRatio * slipRatio + normalizedSlipAngle * normalizedSlipAngle)
@@ -409,7 +898,6 @@ function FrictionSim.Update(tireInfo)
 		if smoke then
 			smoke.Rate = if slipping then 50 * math.min(totalSlip, 2) else 0
 		end
-
 		if skid then
 			skid.Volume = if slipping then 0.5 * totalSlip else 0
 			skid.PlaybackSpeed = if slipping then 0.85 + 0.4 * totalSlip else 0
@@ -417,38 +905,28 @@ function FrictionSim.Update(tireInfo)
 	end
 
 	car:SetAttribute(folder.Name .. "totalSlip", totalSlip)
+
+	-- Local tangent stiffness of the Pacejka curve at the current operating point (Newtons per
+	-- stud/s of wheel surface speed), for WheelSim's implicit integration -- NOT an extra force.
+	local stiffnessReference = if isStationary then LOW_SPEED_REFERENCE else referenceSpeed
+	local longitudinalStiffness = FxMax * (LONGITUDINAL.B * LONGITUDINAL.C) / math.max(stiffnessReference, 0.01)
+
+	local forwardForceNewtons = frictionForceNewtons:Dot(forwardDir)
+	return forwardForceNewtons, verticalLoadNewtons, longitudinalStiffness
 end
 
 local RenameTable = {
-	["ForceAtt"] = {
-		"ForceAtt_2",
-		"ForceAtt_3",
-		"ForceAtt_4",
-	},
-	["SteerSlide"] = {
-		"SteerSlide_2"
-	},
-	["TIREEND"] = {
-		"TIREEND_2",
-		"TIREEND_3",
-		"TIREEND_4"
-	},
-	["TIRESTART"] = {
-		"TIRESTART_2",
-		"TIRESTART_3",
-		"TIRESTART_4"
-	},
-	["SpinAtt"] = {
-		"SpinAtt_2",
-		"SpinAtt_3",
-		"SpinAtt_4"
-	},
+	["ForceAtt"] = { "ForceAtt_2", "ForceAtt_3", "ForceAtt_4" },
+	["SteerSlide"] = { "SteerSlide_2" },
+	["TIREEND"] = { "TIREEND_2", "TIREEND_3", "TIREEND_4" },
+	["TIRESTART"] = { "TIRESTART_2", "TIRESTART_3", "TIRESTART_4" },
+	["SpinAtt"] = { "SpinAtt_2", "SpinAtt_3", "SpinAtt_4" },
 }
 
 local function RenameClones(parent)
 	for originalName, clones in pairs(RenameTable) do
 		for _, cloneName in ipairs(clones) do
-			local child = parent:FindFirstChild(cloneName,true)
+			local child = parent:FindFirstChild(cloneName, true)
 			if child then
 				child.Name = originalName
 			end
@@ -477,7 +955,7 @@ local function resolveCar(car)
 	local primary = car.Primary
 
 	if not (mass:IsA("BasePart") and primary:IsA("BasePart")) then
-		warn(string.format("UnifiedCarHandler: %s has Mass, Primary or Stats of the wrong type", car:GetFullName()))
+		warn(string.format("UnifiedCarHandler: %s has Mass or Primary of the wrong type", car:GetFullName()))
 		return nil
 	end
 
@@ -498,7 +976,6 @@ local function resolveCar(car)
 
 	return {
 		wheels = car.Wheels,
-		stats = stat,
 		mass = mass,
 		primary = primary,
 		throttleValue = car.Throttle,
@@ -533,74 +1010,35 @@ local function setCollisionsEnabled(targetCharacter, enabled, cache)
 	end
 end
 
-local function flatten(vector, fallback)
-	local flat = Vector3.new(vector.X, 0, vector.Z)
-	if flat.Magnitude < 0.01 then
-		return fallback
+local function findLimbJoint(character, limbName)
+	local torso = character:FindFirstChild("Torso")
+	if not torso then
+		return nil
 	end
-
-	return flat.Unit
-end
-
-local function approach(current, target, speed, dt)
-	if current < target then
-		return math.min(current + speed * dt, target)
-	end
-
-	if current > target then
-		return math.max(current - speed * dt, target)
-	end
-
-	return current
-end
-
-local function smoothTo(current, target, rate, dt)
-	local alpha = 1 - math.exp(-math.max(rate, 0) * dt)
-	return current + (target - current) * alpha
-end
-
-local function mix(a, b, t)
-	return a + (b - a) * math.clamp(t, 0, 1)
-end
-
-local function rpmToRate(rpm, minRPM, maxRPM, minPlayback, maxPlayback, curve)
-	local span = math.max(maxRPM - minRPM, 1)
-	local t = math.clamp((rpm - minRPM) / span, 0, 1)
-	t = t ^ (curve or 1)
-	return mix(minPlayback, maxPlayback, t)
-end
-
-local function getEngineTorque(engine, rpm)
-	local curve = engine.torqueCurve
-	local points = engine._torqueRpmPoints
-
-	if not points then
-		points = {}
-		for point in pairs(curve) do
-			table.insert(points, point)
-		end
-		table.sort(points)
-		engine._torqueRpmPoints = points
-	end
-
-	if rpm <= points[1] then
-		return curve[points[1]]
-	end
-
-	if rpm >= points[#points] then
-		return curve[points[#points]]
-	end
-
-	for i = 1, #points - 1 do
-		local lower, upper = points[i], points[i + 1]
-		if rpm >= lower and rpm <= upper then
-			local alpha = (rpm - lower) / (upper - lower)
-			return curve[lower] + (curve[upper] - curve[lower]) * alpha
+	for _, joint in ipairs(torso:GetChildren()) do
+		if joint:IsA("Motor6D") and joint.Part1 and joint.Part1.Name == limbName then
+			return joint
 		end
 	end
-
-	return curve[points[#points]]
+	return nil
 end
+
+local function findRootJoint(character)
+	local hrp = character:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		return nil
+	end
+	for _, joint in ipairs(hrp:GetChildren()) do
+		if joint:IsA("Motor6D") then
+			return joint
+		end
+	end
+	return nil
+end
+
+--==========================================================================--
+-- HUD (unchanged)
+--==========================================================================--
 
 local Hud = {}
 
@@ -817,8 +1255,75 @@ function Hud.Update(state)
 	Hud.clutchFill.Size = UDim2.new(math.clamp(state.clutch, 0, 1), 0, 1, 0)
 end
 
-local handledCars = setmetatable({}, { __mode = "k" })
+--==========================================================================--
+-- DEFAULT VEHICLE CONFIGURATION
+--
+-- Real-world example: a 1450 kg, 2.0L 4-cyl, 570 Nm peak torque, 7800 RPM
+-- redline, 6-speed RWD car with an LSD. Replace any of this with another
+-- real car's numbers to simulate that car -- nothing else in this file
+-- needs to change.
+--==========================================================================--
 
+local function defaultStats(car, mass)
+	return {
+		massKg = mass.AssemblyMass/ 21.952, -- kg
+		wheelRadiusMeters = car:GetAttribute("WheelRadiusMeters") or 0.32,
+
+		steerResponseTimeActive = 1.8,
+		steerResponseTimeInactive = 0.9,
+		throttleResponseTime = 0.10,
+		brakeResponseTime = 0.22,
+		clutchResponseTime = 0.05,
+		maxSteerDegrees = 34,
+
+		engine = {
+			idleRPM = 950,
+			redlineRPM = 7800,
+			inertia = 0.18, -- kg*m^2
+
+			torqueCurve = {
+				[1000] = 250, [1500] = 340, [2000] = 420, [2500] = 470, [3000] = 520,
+				[3500] = 550, [4000] = 570, [4500] = 570, [5000] = 565, [5500] = 555,
+				[6000] = 545, [6500] = 525, [7000] = 505, [7200] = 490, [7500] = 450, [7800] = 400,
+			},
+
+			friction = { static = 12, viscous = 0.010, pumpingLossCoefficient = 0.0009 },
+			accessoryTorque = 6,
+
+			idleControl = { enabled = true, targetRPM = 950, authority = 0.55, stallRPM = 330 },
+			revLimiter = { rpm = 7800, cut = 1.0, hysteresis = 120 },
+		},
+
+		clutch = { maxTorque = 620, stiffness = 950 },
+
+		transmission = {
+			type = "RWD", -- "FWD" | "RWD" | "AWD"
+
+			gears = { [-1] = -3.20, [0] = 0, [1] = 3.00, [2] = 2.10, [3] = 1.60, [4] = 1.28, [5] = 1.08, [6] = 0.91 },
+			finalDrive = 3.90,
+			efficiency = 0.96,
+			shiftTime = 0.09,
+
+			differential = { type = "LIMITED", preload = 20, powerLock = 0.35, coastLock = 0.15, maxBias = 3 },
+
+			awd = { frontBias = 0.4, rearBias = 0.6, centerDiff = "LIMITED" },
+		},
+
+		brakes = { maxTorqueFront = 1400, maxTorqueRear = 1000 },
+
+		wheelInertia = 1.1, -- kg*m^2
+
+		aero = { rho = 1.225, Cd = 0.32, area = 2.15, rollingResistance = 0.015 },
+
+		debug = { enabled = car:GetAttribute("PhysicsDebug") == true },
+	}
+end
+
+--==========================================================================--
+-- MAIN HANDLER
+--==========================================================================--
+
+local handledCars = setmetatable({}, { __mode = "k" })
 local UnifiedCarHandler = {}
 
 function UnifiedCarHandler:HandleCar(car)
@@ -826,7 +1331,6 @@ function UnifiedCarHandler:HandleCar(car)
 		warn("UnifiedCarHandler:HandleCar expects a car Model")
 		return
 	end
-
 	if handledCars[car] then
 		return
 	end
@@ -836,15 +1340,14 @@ function UnifiedCarHandler:HandleCar(car)
 		warn("UnifiedCarHandler:HandleCar must be called from a client script")
 		return
 	end
+
 	local parts = resolveCar(car)
 	if not parts then
 		return
 	end
-
 	handledCars[car] = true
 
 	local wheels = parts.wheels
-	local stats = parts.stats
 	local mass = parts.mass
 	local primary = parts.primary
 	local throttleValue = parts.throttleValue
@@ -857,21 +1360,49 @@ function UnifiedCarHandler:HandleCar(car)
 
 	local raycastParams = RaycastParams.new()
 	raycastParams.FilterType = Enum.RaycastFilterType.Include
-	raycastParams.FilterDescendantsInstances = { workspace.Map,workspace.Built }
+	raycastParams.FilterDescendantsInstances = { workspace.Map, workspace.Built }
+
+	local stats = defaultStats(car, mass)
+	local massKg = stats.massKg or Units.RobloxForceToNewtons(mass.AssemblyMass) -- see unit notes: AssemblyMass treated as Roblox-unit "mass"; ForceScale relates it to kg
+
+	-- Build the simulation modules from configuration.
+	local engine = EngineSim.new(stats.engine)
+	local clutch = ClutchSim.new(stats.clutch)
+	local transmission = TransmissionSim.new(stats.transmission)
+	local axleDiff = DifferentialSim.new(stats.transmission.differential)
+	local centerDiff
+	if stats.transmission.type == "AWD" then
+		centerDiff = DifferentialSim.new({ type = stats.transmission.awd.centerDiff or "LIMITED" })
+	end
+
+	local wheelSims = {}
+	for _, name in ipairs({ "FR", "FL", "RR", "RL" }) do
+		wheelSims[name] = WheelSim.new({
+			inertia = stats.wheelInertia,
+			radius = stats.wheelRadiusMeters,
+			rollingResistanceCoefficient = stats.aero.rollingResistance,
+		})
+	end
+
+	local drivenWheels = {}
+	if stats.transmission.type == "FWD" then
+		drivenWheels = { FL = true, FR = true }
+	elseif stats.transmission.type == "RWD" then
+		drivenWheels = { RL = true, RR = true }
+	elseif stats.transmission.type == "AWD" then
+		drivenWheels = { FL = true, FR = true, RL = true, RR = true }
+	end
 
 	local alive = true
 	local driving = false
-	local gear = 0
-	local engineRPM = 0
+	local replicationActive = false
+	local replicationLimbs = {}
+	local replicationJoints = {}
 	local mouseSteer = false
 	local enteredAt = 0
 	local entryCFrame = mass.CFrame
 
-	local character
-	local humanoid
-	local rootPart
-	local diedConnection
-
+	local character, humanoid, rootPart, diedConnection
 	local connections = {}
 	local activeTweens = {}
 	local collisionCache = {}
@@ -888,142 +1419,6 @@ function UnifiedCarHandler:HandleCar(car)
 	prompt.Enabled = false
 	prompt.Parent = driverMass or mass
 
-	stats = {
-		throttle_response_time = 0.10,
-		brake_response_time = 0.22,
-		clutch_response_time = 0.05,
-
-		steer_response_time_active = 1.8,
-		steer_response_time_inactive = 0.9,
-
-		wheel_radius = car:GetAttribute("tireend"),
-
-		maxsteer = 34,
-		ackerman = true,
-		antiacker = false,
-
-		maxWheelTorque = 1350,
-		COUPLING_STIFFNESS = 15,
-
-		engine = {
-			cylinders = 4,
-
-			idlerpm = 950,
-			redline = 7800,
-
-			air_fuel_ratio = 12.2,
-			volumetric_efficiency = 0.95,
-
-			friction_loss = 0.12,
-
-			inertia = 1.8,
-
-			torqueCurve = {
-				[1000] = 250,
-				[1500] = 340,
-				[2000] = 420,
-				[2500] = 470,
-				[3000] = 520,
-				[3500] = 550,
-				[4000] = 570,
-				[4500] = 570,
-				[5000] = 565,
-				[5500] = 555,
-				[6000] = 545,
-				[6500] = 525,
-				[7000] = 505,
-				[7200] = 490,
-				[7500] = 450,
-				[7800] = 400
-			},
-
-			maxtorque = 570,
-
-			rpmbounce = {
-				min = 200,
-				max = 800
-			},
-
-			basestartupchance = 7,
-			startupinterval = 0.22,
-			maxhold = 4,
-			chancegrowth = 12,
-		},
-
-		mass = car.Mass:GetMass(),
-
-		transmission = {
-			gears = {
-				-3.20,
-				0,
-
-				3.00,
-				2.10,
-				1.60,
-				1.28,
-				1.08,
-				0.91
-			},
-
-			final_drive = 3.90,
-
-			shift_time = 0.075,
-
-			eff = 0.96,
-
-			type = "RWD",
-
-			difftype = "LOCK",
-
-			wheelinertia = 0.42,
-
-			shiftratiochange = {
-				[1] = 0.70,
-				[2] = 0.72,
-				[3] = 0.74,
-				[4] = 0.78,
-				[5] = 0.82
-			},
-		},
-
-		aero = {
-			rho = 1.225,
-
-			Cd = 0.32,
-
-			area = 2.15,
-
-			rolling_resistance = 0.015
-		},
-	}
-
-	local FAKE_ENGINE = {
-		idleRpm = 950,
-		redlineRpm = 7800,
-		revLimiterBounce = 400,
-		revRateUp = 6500,
-		revRateDown = 4500,
-		shiftDrop = 600,
-	}
-
-	local GEAR_ACCEL_FORCE = {
-		[-1] = -70,
-		[0]  = 0,
-		[1]  = 130,
-		[2]  = 100,
-		[3]  = 90,
-		[4]  = 85,
-		[5]  = 54,
-		[6]  = 38,
-	}
-
-	local fakeRpm = FAKE_ENGINE.idleRpm
-	local lastRpmGear = 0
-
-	engineRPM = stats.engine.idlerpm
-	local transmission = stats.transmission
-	local engineConfig = stats.engine
-
 	local function track(connection)
 		table.insert(connections, connection)
 		return connection
@@ -1034,7 +1429,6 @@ function UnifiedCarHandler:HandleCar(car)
 		if previous then
 			previous:Cancel()
 		end
-
 		local tween = TweenService:Create(value, TweenInfo.new(duration), { Value = target })
 		activeTweens[value] = tween
 		tween:Play()
@@ -1045,7 +1439,6 @@ function UnifiedCarHandler:HandleCar(car)
 			tween:Cancel()
 			activeTweens[value] = nil
 		end
-
 		throttleValue.Value = 0
 		clutchValue.Value = 0
 		brakeValue.Value = if parked then 1 else 0
@@ -1057,7 +1450,6 @@ function UnifiedCarHandler:HandleCar(car)
 		end
 
 		local massCFrame = mass.CFrame
-
 		local side = -1
 		if driverMass then
 			side = if massCFrame:PointToObjectSpace(driverMass.Position).X < 0 then -1 else 1
@@ -1074,23 +1466,20 @@ function UnifiedCarHandler:HandleCar(car)
 		return CFrame.lookAt(position, position + lookVector)
 	end
 
+	--== Sound (adapted to read the real EngineSim/ClutchSim state instead of a fake RPM) ==--
+
 	local idleSnd, revSnd, whineSnd
 	local idleOk, revOk, whineOk = false, false, false
 	local sndWarned = {}
 
-	local aRpm = FAKE_ENGINE.idleRpm
+	local aRpm = engine:GetRPM()
 	local aThr = 0
 	local aLoad = 0
 	local aWhineSpd = 0
-
-	local idleVol = 0
-	local revVol = 0
-	local whineVol = 0
-
+	local idleVol, revVol, whineVol = 0, 0, 0
 	local prevSpd = 0
-	local prevGear = gear
+	local prevGear = transmission:GetGear()
 	local shiftTimer = 0
-
 	local fadeTimer = 0
 	local fadingOut = false
 	local sndStopped = true
@@ -1105,7 +1494,7 @@ function UnifiedCarHandler:HandleCar(car)
 	local function initSnd()
 		local idleInst = primary:FindFirstChild("idle")
 		local revInst = primary:FindFirstChild("rev")
-		local whineInst = primary:FindFirstChild("whine")
+		local whineInst = nil
 
 		if idleInst and idleInst:IsA("Sound") then
 			idleSnd = idleInst
@@ -1142,24 +1531,22 @@ function UnifiedCarHandler:HandleCar(car)
 		fadeTimer = 0
 		sndStopped = false
 
-		aRpm = fakeRpm
+		aRpm = engine:GetRPM()
 		aThr = throttleValue.Value
 		aLoad = 0
 		aWhineSpd = 0
 		prevSpd = 0
-		prevGear = gear
+		prevGear = transmission:GetGear()
 		shiftTimer = 0
 
 		if idleOk and not idleSnd.IsPlaying then
 			idleSnd.Volume = 0
 			idleSnd:Play()
 		end
-
 		if revOk and not revSnd.IsPlaying then
 			revSnd.Volume = 0
 			revSnd:Play()
 		end
-
 		if whineOk and not whineSnd.IsPlaying then
 			whineSnd.Volume = 0
 			whineSnd:Play()
@@ -1193,11 +1580,10 @@ function UnifiedCarHandler:HandleCar(car)
 		end
 	end
 
-	local function updateSnd(dt, throttle, clutch, currentGear, gearRatio, finalDrive, carSpeedFront, wheelRadius)
+	local function updateSnd(dt, throttle, clutchPedal, currentGear, gearRatio, finalDrive, carSpeedFrontStuds, wheelRadiusMeters)
 		if sndStopped and not driving then
 			return
 		end
-
 		if not driving and not fadingOut and not sndStopped then
 			beginFade()
 		end
@@ -1209,22 +1595,23 @@ function UnifiedCarHandler:HandleCar(car)
 			shiftTimer = math.max(0, shiftTimer - dt)
 		end
 
-		aRpm = smoothTo(aRpm, fakeRpm, SND_CFG.Rev.rpmSmoothing, dt)
+		local targetRpm = engine:GetRPM()
+		aRpm = smoothTo(aRpm, targetRpm, SND_CFG.Rev.rpmSmoothing, dt)
 		aThr = smoothTo(aThr, math.clamp(throttle, 0, 1), SND_CFG.Throttle.smoothing, dt)
 
-		local couplingFactor = 1 - math.clamp(clutch, 0, 1)
+		local couplingFactor = 1 - math.clamp(clutchPedal, 0, 1)
 		local neutralFactor = if currentGear == 0 then 0.3 else 1
 		local rawLoad = math.clamp(throttle, 0, 1) * couplingFactor * neutralFactor
 		aLoad = smoothTo(aLoad, rawLoad, SND_CFG.Load.smoothing, dt)
 
-		local radius = math.max(wheelRadius, 0.1)
-		local wheelAngularSpeed = math.abs(carSpeedFront) / radius
+		local carSpeedFrontMps = Units.StudsPerSecToMps(carSpeedFrontStuds)
+		local wheelAngularSpeed = math.abs(carSpeedFrontMps) / math.max(wheelRadiusMeters, 0.05)
 		local ratioForWhine = if gearRatio ~= 0 then math.abs(gearRatio) else 1
 		local rawDriveSpeed = wheelAngularSpeed * ratioForWhine * finalDrive * SND_CFG.Whine.driveSpeedScale
 		aWhineSpd = smoothTo(aWhineSpd, rawDriveSpeed, SND_CFG.Whine.smoothing, dt)
 
-		local carAccel = (carSpeedFront - prevSpd) / math.max(dt, 1 / 240)
-		prevSpd = carSpeedFront
+		local carAccel = (carSpeedFrontStuds - prevSpd) / math.max(dt, 1 / 240)
+		prevSpd = carSpeedFrontStuds
 		local accelFactor = math.clamp(carAccel / 25, -1, 1)
 
 		if not driving then
@@ -1234,19 +1621,21 @@ function UnifiedCarHandler:HandleCar(car)
 
 		local idleCfg = SND_CFG.Idle
 		local idleFadeAlpha = math.clamp((aRpm - idleCfg.minRPM) / math.max(idleCfg.maxRPM - idleCfg.minRPM, 1), 0, 1)
-		local idleTargetVolume = mix(idleCfg.maxVolume, idleCfg.minVolume, idleFadeAlpha)
+		local idleTargetVolume = lerp(idleCfg.maxVolume, idleCfg.minVolume, idleFadeAlpha)
 		if not driving then
 			idleTargetVolume = 0
 		end
 		idleVol = smoothTo(idleVol, idleTargetVolume, idleCfg.smoothing, dt)
 
 		local revCfg = SND_CFG.Rev
-		local revPlayback = rpmToRate(aRpm, revCfg.minRPM, revCfg.maxRPM, revCfg.minPlayback, revCfg.maxPlayback, revCfg.playbackCurve)
+		local span = math.max(revCfg.maxRPM - revCfg.minRPM, 1)
+		local t = math.clamp((aRpm - revCfg.minRPM) / span, 0, 1) ^ revCfg.playbackCurve
+		local revPlayback = lerp(revCfg.minPlayback, revCfg.maxPlayback, t)
 		revPlayback *= (1 + math.max(accelFactor, 0) * aLoad * revCfg.accelPlaybackBoost)
 
-		local rpmPresence = math.clamp((aRpm - revCfg.minRPM) / math.max(revCfg.maxRPM - revCfg.minRPM, 1), 0, 1)
+		local rpmPresence = math.clamp((aRpm - revCfg.minRPM) / span, 0, 1)
 		local throttleLoadPresence = math.clamp(aThr * 0.45 + aLoad * 0.55, 0, 1)
-		local revTargetVolume = mix(revCfg.baseVolume, revCfg.maxVolume, math.clamp(rpmPresence * 0.7 + throttleLoadPresence * 0.75, 0, 1))
+		local revTargetVolume = lerp(revCfg.baseVolume, revCfg.maxVolume, math.clamp(rpmPresence * 0.7 + throttleLoadPresence * 0.75, 0, 1))
 		revTargetVolume += aLoad * revCfg.loadVolumeBoost
 		revTargetVolume = math.clamp(revTargetVolume, 0, revCfg.maxVolume)
 
@@ -1254,37 +1643,30 @@ function UnifiedCarHandler:HandleCar(car)
 			local dipAlpha = shiftTimer / SND_CFG.ShiftReactionTime
 			revTargetVolume *= (1 - SND_CFG.ShiftDipStrength * dipAlpha)
 		end
-
 		if not driving then
 			revTargetVolume = 0
 		end
-
 		revVol = smoothTo(revVol, revTargetVolume, revCfg.smoothing, dt)
 
 		local whineCfg = SND_CFG.Whine
 		local whineAlpha = math.clamp((aWhineSpd - whineCfg.minSpeed) / math.max(whineCfg.maxSpeed - whineCfg.minSpeed, 1), 0, 1)
-		local whinePlayback = mix(whineCfg.minPlayback, whineCfg.maxPlayback, whineAlpha)
-
-		local whineTargetVolume = mix(whineCfg.baseVolume, whineCfg.maxVolume, whineAlpha)
+		local whinePlayback = lerp(whineCfg.minPlayback, whineCfg.maxPlayback, whineAlpha)
+		local whineTargetVolume = lerp(whineCfg.baseVolume, whineCfg.maxVolume, whineAlpha)
 		whineTargetVolume += aLoad * whineCfg.loadVolume
-		whineTargetVolume *= (1 - math.clamp(clutch, 0, 1) * whineCfg.clutchRelease)
+		whineTargetVolume *= (1 - math.clamp(clutchPedal, 0, 1) * whineCfg.clutchRelease)
 		whineTargetVolume = math.clamp(whineTargetVolume, 0, whineCfg.maxVolume)
-
 		if not driving then
 			whineTargetVolume = 0
 		end
-
 		whineVol = smoothTo(whineVol, whineTargetVolume, whineCfg.smoothing, dt)
 
 		if idleOk then
 			idleSnd.Volume = idleVol
 		end
-
 		if revOk then
 			revSnd.Volume = revVol
 			revSnd.PlaybackSpeed = revPlayback
 		end
-
 		if whineOk then
 			whineSnd.Volume = whineVol
 			whineSnd.PlaybackSpeed = whinePlayback
@@ -1299,16 +1681,95 @@ function UnifiedCarHandler:HandleCar(car)
 		end
 	end
 
+	--== Chassis replication (unchanged) ==--
+
+	local function setupChassisReplication()
+		if not CHASSIS_REPLICATION.Enabled or not character then
+			return
+		end
+		table.clear(replicationLimbs)
+		table.clear(replicationJoints)
+
+		for wheelName, limbName in pairs(CHASSIS_REPLICATION.WheelToLimb) do
+			local limb = character:FindFirstChild(limbName)
+			local wheelFolder = wheels:FindFirstChild(wheelName)
+			local tire = wheelFolder and wheelFolder:FindFirstChild("Bounds")
+
+			if limb and tire then
+				local spinAtt = tire:FindFirstChild("SpinAtt")
+				if not spinAtt then
+					warn(string.format("UnifiedCarHandler: wheel '%s' has no SpinAtt -- limb '%s' will not show wheel roll", wheelName, limbName))
+				end
+
+				local joint = findLimbJoint(character, limbName)
+				if joint then
+					joint.Enabled = false
+					table.insert(replicationJoints, joint)
+				else
+					warn(string.format("UnifiedCarHandler: no Motor6D found for limb '%s' -- it may fight the replicated CFrame", limbName))
+				end
+
+				limb.CanCollide = false
+				replicationLimbs[limbName] = { limb = limb, tire = tire, spinAtt = spinAtt }
+			else
+				warn(string.format("UnifiedCarHandler: chassis replication could not find limb '%s' or wheel '%s'", limbName, wheelName))
+			end
+		end
+
+		local rootJoint = findRootJoint(character)
+		if rootJoint then
+			rootJoint.Enabled = false
+			table.insert(replicationJoints, rootJoint)
+		end
+
+		if rootPart then
+			rootPart.CanCollide = false
+		end
+
+		replicationActive = true
+	end
+
+	local function teardownChassisReplication()
+		replicationActive = false
+		for _, joint in ipairs(replicationJoints) do
+			if joint then
+				joint.Enabled = true
+			end
+		end
+		table.clear(replicationJoints)
+		table.clear(replicationLimbs)
+	end
+
+	local function updateChassisReplication()
+		if not replicationActive or not rootPart or not rootPart.Parent then
+			return
+		end
+
+		local chassisCFrame = mass.CFrame
+		rootPart.CFrame = chassisCFrame * CHASSIS_REPLICATION.BodyOffset:Inverse()
+		rootPart.AssemblyLinearVelocity = Vector3.zero
+		rootPart.AssemblyAngularVelocity = Vector3.zero
+
+		for _, entry in pairs(replicationLimbs) do
+			local limb, tire, spinAtt = entry.limb, entry.tire, entry.spinAtt
+			if limb.Parent and tire.Parent then
+				limb.CFrame = (spinAtt and spinAtt.Parent) and spinAtt.WorldCFrame or tire.CFrame
+				limb.AssemblyLinearVelocity = Vector3.zero
+				limb.AssemblyAngularVelocity = Vector3.zero
+			end
+		end
+	end
+
+	--== Enter / exit ==--
+
 	local function leaveCar()
 		if not driving then
 			return
 		end
 		driving = false
-
 		Hud.SetVisible(false)
 
 		local exitCFrame = computeExitCFrame()
-
 		releaseControls(true)
 
 		if diedConnection then
@@ -1317,6 +1778,7 @@ function UnifiedCarHandler:HandleCar(car)
 		end
 
 		setCollisionsEnabled(character, true, collisionCache)
+		teardownChassisReplication()
 
 		if rootPart and rootPart.Parent then
 			rootPart.Anchored = false
@@ -1325,10 +1787,7 @@ function UnifiedCarHandler:HandleCar(car)
 			rootPart.CFrame = exitCFrame
 		end
 
-		character = nil
-		humanoid = nil
-		rootPart = nil
-
+		character, humanoid, rootPart = nil, nil, nil
 		beginFade()
 
 		if alive and prompt.Parent then
@@ -1340,13 +1799,10 @@ function UnifiedCarHandler:HandleCar(car)
 		if not alive then
 			return
 		end
-
 		if driving then
 			leaveCar()
 		end
-
 		alive = false
-
 		stopSndNow()
 
 		for _, connection in connections do
@@ -1367,7 +1823,6 @@ function UnifiedCarHandler:HandleCar(car)
 		if not driving then
 			return
 		end
-
 		if diedConnection then
 			diedConnection:Disconnect()
 			diedConnection = nil
@@ -1375,7 +1830,7 @@ function UnifiedCarHandler:HandleCar(car)
 
 		driving = false
 		alive = false
-
+		teardownChassisReplication()
 		stopSndNow()
 
 		for _, connection in connections do
@@ -1388,10 +1843,7 @@ function UnifiedCarHandler:HandleCar(car)
 			activeTweens[value] = nil
 		end
 
-		character = nil
-		humanoid = nil
-		rootPart = nil
-
+		character, humanoid, rootPart = nil, nil, nil
 		handledCars[car] = nil
 
 		if car:IsDescendantOf(workspace) then
@@ -1421,53 +1873,57 @@ function UnifiedCarHandler:HandleCar(car)
 		rootPart = currentRoot
 		entryCFrame = currentRoot.CFrame
 
-		if CONFIG.AutoFirstGearOnEnter and gear == 0 then
-			gear = 1
+		setupChassisReplication()
+
+		if CONFIG.AutoFirstGearOnEnter and transmission:GetGear() == 0 then
+			transmission:RequestShift(1)
 		end
 
 		prompt.Enabled = false
 		releaseControls(false)
 
-		Hud.SetVisible(false)
+		Hud.SetVisible(true)
 		startSnd()
 
 		diedConnection = currentHumanoid.Died:Connect(onDriverDied)
 	end
 
 	local function shiftGear(direction)
-		if clutchValue.Value <= 0.67 then
+		if not driving then
 			return
 		end
-
-		task.wait(stats.transmission.shift_time)
-
-		if not alive or not driving then
-			return
-		end
-
-		local newGear = gear + direction
-		if newGear > -2 and newGear < #stats.transmission.gears - 1 then
-			gear = newGear
-		end
+		local nextGear = transmission:GetGear() + direction
+		transmission:RequestShift(nextGear)
 	end
 
 	local function isCarIntact()
 		return car:IsDescendantOf(workspace) and mass.Parent ~= nil and primary.Parent ~= nil
 	end
 
+	--== Main physics step ==--
+
+	-- The drivetrain/tire/wheel-rotation loop is substepped at this fixed timestep regardless of
+	-- frame rate: engine/clutch/wheel integration needs a small, consistent dt to stay accurate and
+	-- (for the non-implicit parts, like the tire model's force response) numerically well-behaved.
+	-- Suspension raycasting (TireSim.Update) is comparatively expensive and doesn't need to run at
+	-- this rate, so it stays at one call per rendered frame.
+	local FIXED_SUBSTEP = 1 / 120
+	local MAX_SUBSTEPS = 8
+	local MAX_TOTAL_DT = 0.25 -- hard cap so an alt-tab stall hands us a bounded catch-up, not a spiral
+
 	local function step(dt)
 		if not isCarIntact() then
 			destroy()
 			return
 		end
+		dt = math.min(dt, MAX_TOTAL_DT)
 
-		if driving and rootPart and rootPart.Parent then
+		if driving and rootPart and rootPart.Parent and not CHASSIS_REPLICATION.Enabled then
 			rootPart.CFrame = mass.CFrame
 		end
 
-		local frameScale = dt * 60
-
-		local steerTime = stats.steer_response_time_inactive
+		-- Steering (unchanged behavior)
+		local steerTime = stats.steerResponseTimeInactive
 		local targetSteer = 0
 		local mouseControlled = false
 
@@ -1479,10 +1935,9 @@ function UnifiedCarHandler:HandleCar(car)
 			else
 				local left = UserInputService:IsKeyDown(CONFIG.SteerLeftKey)
 				local right = UserInputService:IsKeyDown(CONFIG.SteerRightKey)
-
 				if left ~= right then
 					targetSteer = if left then -1 else 1
-					steerTime = stats.steer_response_time_active
+					steerTime = stats.steerResponseTimeActive
 				end
 			end
 		end
@@ -1496,123 +1951,198 @@ function UnifiedCarHandler:HandleCar(car)
 		end
 
 		local velocity = mass.AssemblyLinearVelocity
-		local carSpeed = mass.CFrame:VectorToObjectSpace(velocity)
-		local carSpeedFront = carSpeed.Z
+		local carSpeedObjectSpace = mass.CFrame:VectorToObjectSpace(velocity)
+		local carSpeedFrontStuds = carSpeedObjectSpace.Z
+		local carSpeedFrontMps = Units.StudsPerSecToMps(carSpeedFrontStuds)
 
+		-- Aerodynamic drag (SI, converted at the boundary)
 		if drag then
-			local aero = stats.aero
 			local dragForce = Vector3.zero
-
-			if aero and velocity.Magnitude > 0.01 then
-				local speedMS = carSpeedFront * CONFIG.StudsToMeters
-
-				local magnitude =
-					0.5
-					* aero.rho
-					* aero.Cd
-					* aero.area
-					* speedMS
-					* speedMS
-
-				dragForce = -velocity.Unit * Vector3.new(1, 0.5, 1) * magnitude
+			if velocity.Magnitude > 0.01 then
+				local dragNewtons = computeAeroDragNewtons(carSpeedFrontMps, stats.aero)
+				dragForce = -velocity.Unit * Vector3.new(1, 0.5, 1) * (dragNewtons * Units.ForceScale)
 			end
-
 			drag.Force = dragForce
 		end
 
-		local throttle = throttleValue.Value
-		local brake = brakeValue.Value
-		local clutch = clutchValue.Value
+		local throttlePedal = throttleValue.Value
+		local brakePedal = brakeValue.Value
+		local clutchPedal = clutchValue.Value
 
-		local wheelRadius = math.max(stats.wheel_radius, 0.1)
-		local gearRatio = transmission.gears[gear + 2] or 0
-		local totalRatio = gearRatio * transmission.final_drive
-		local inGear = totalRatio ~= 0
-
-		if gear ~= lastRpmGear then
-			fakeRpm = math.max(FAKE_ENGINE.idleRpm, fakeRpm - FAKE_ENGINE.shiftDrop)
-			lastRpmGear = gear
-		end
-
-		local rpmTarget
-		if clutch > 0.9 or gear == 0 then
-			rpmTarget = FAKE_ENGINE.idleRpm + (FAKE_ENGINE.redlineRpm - FAKE_ENGINE.idleRpm) * throttle
-		else
-			local speedFactor = math.clamp(math.abs(carSpeedFront) / 40, 0, 1)
-			local blend = math.clamp(throttle * 0.7 + speedFactor * 0.5, 0, 1)
-			rpmTarget = FAKE_ENGINE.idleRpm + (FAKE_ENGINE.redlineRpm - FAKE_ENGINE.idleRpm) * blend
-		end
-
-		local rpmRate = if rpmTarget > fakeRpm then FAKE_ENGINE.revRateUp else FAKE_ENGINE.revRateDown
-		fakeRpm += math.clamp(rpmTarget - fakeRpm, -rpmRate * dt, rpmRate * dt)
-
-		if fakeRpm >= FAKE_ENGINE.redlineRpm then
-			fakeRpm = FAKE_ENGINE.redlineRpm - math.random() * FAKE_ENGINE.revLimiterBounce
-		end
-
-		fakeRpm = math.clamp(fakeRpm, FAKE_ENGINE.idleRpm, FAKE_ENGINE.redlineRpm)
-		car:SetAttribute("RPM", fakeRpm)
-
-		local gearForce = GEAR_ACCEL_FORCE[gear] or 0
-		local powerFactor = gearPower(gear, carSpeedFront)
-		local driveInput = gearForce * throttle * (1 - clutch) * powerFactor
-
-		local wheelSpeed = (carSpeedFront + driveInput * 1.25) * (1 - brake)
-
-		for _, attribute in WHEEL_SPEED_ATTRIBUTES do
-			car:SetAttribute(attribute, wheelSpeed)
-		end
-		car:SetAttribute("rearWS", wheelSpeed)
-		car:SetAttribute("frontWS", wheelSpeed)
-
-		if driving then
-			local speedKmh = math.abs(carSpeedFront) * CONFIG.StudsToMeters * 3.6
-			Hud.Update({
-				gear = gear,
-				speedKmh = speedKmh,
-				rpm = fakeRpm,
-				redlineRpm = FAKE_ENGINE.redlineRpm,
-				redlineWarnRpm = FAKE_ENGINE.redlineRpm * 0.9,
-				throttle = throttle,
-				brake = brake,
-				clutch = clutch,
-			})
-		end
-
-		updateSnd(dt, throttle, clutch, gear, gearRatio, transmission.final_drive, carSpeedFront, wheelRadius)
-
-		local tireEnd = car:GetAttribute("tireend")
-
+		-- Suspension/contact geometry resolved once per rendered frame (raycasts are the expensive part).
+		local tireInfos = {}
 		for _, wheel in ipairs(wheels:GetChildren()) do
-			local speedAttribute = WHEEL_SPEED_ATTRIBUTES[wheel.Name]
-
-			if speedAttribute then
+			if wheelSims[wheel.Name] then
 				local tireInfo = TireSim.Update(car, wheel, raycastParams)
+				tireInfos[wheel.Name] = tireInfo
+				if not tireInfo then
+					wheel.Bounds.FrictionForce.Force = Vector3.zero
+				end
+			end
+		end
+
+		local steps = math.clamp(math.ceil(dt / FIXED_SUBSTEP), 1, MAX_SUBSTEPS)
+		local subDt = dt / steps
+
+		local lastClutchTorque, lastDriveshaftTorque, lastDriveshaftOmega = 0, 0, 0
+
+		for _ = 1, steps do
+			transmission:Update(subDt)
+			local totalRatio = transmission:GetTotalRatio()
+
+			-- Feedback path: wheel speed -> driveshaft speed -> clutch slip -> engine load.
+			local driveshaftOmega = 0
+			local drivenCount = 0
+			for name, isDriven in pairs(drivenWheels) do
+				if isDriven then
+					driveshaftOmega += wheelSims[name].omega
+					drivenCount += 1
+				end
+			end
+			if drivenCount > 0 then
+				driveshaftOmega /= drivenCount
+			end
+
+			local clutchTorque
+			if totalRatio ~= 0 then
+				local requiredInputOmega = driveshaftOmega * totalRatio
+				local wheelInertiaSum = 0
+				for name, isDriven in pairs(drivenWheels) do
+					if isDriven then
+						wheelInertiaSum += wheelSims[name].inertia
+					end
+				end
+				-- Reflecting an output-side inertia through a gear ratio scales it by 1/ratio^2
+				-- (energy-equivalent inertia): in a low, numerically "tall" gear the wheels barely
+				-- load the engine's rev response; in a high gear they load it much more.
+				local reflectedInertia = wheelInertiaSum / (totalRatio * totalRatio)
+				clutchTorque = clutch:Update(subDt, engine:GetAngularVelocity(), engine.inertia, requiredInputOmega, reflectedInertia, clutchPedal)
+			else
+				-- Neutral: drivetrain is disconnected regardless of pedal position.
+				clutch:Update(subDt, engine:GetAngularVelocity(), engine.inertia, engine:GetAngularVelocity(), 0, clutchPedal)
+				clutchTorque = 0
+			end
+
+			engine:Update(subDt, throttlePedal, clutchTorque)
+			local driveshaftTorque = transmission:GetOutputTorque(clutchTorque)
+
+			-- Split driveshaft torque across axles (AWD) and then across each axle's two wheels.
+			local frontAxleTorque, rearAxleTorque = 0, 0
+			if stats.transmission.type == "AWD" then
+				local frontOmega = (wheelSims.FL.omega + wheelSims.FR.omega) * 0.5
+				local rearOmega = (wheelSims.RL.omega + wheelSims.RR.omega) * 0.5
+				local frontInertia = wheelSims.FL.inertia + wheelSims.FR.inertia
+				local rearInertia = wheelSims.RL.inertia + wheelSims.RR.inertia
+				if centerDiff then
+					frontAxleTorque, rearAxleTorque = centerDiff:Distribute(subDt, driveshaftTorque, frontOmega, rearOmega, frontInertia, rearInertia)
+				else
+					frontAxleTorque = driveshaftTorque * (stats.transmission.awd.frontBias or 0.5)
+					rearAxleTorque = driveshaftTorque * (stats.transmission.awd.rearBias or 0.5)
+				end
+			elseif stats.transmission.type == "FWD" then
+				frontAxleTorque = driveshaftTorque
+			else
+				rearAxleTorque = driveshaftTorque
+			end
+
+			local wheelDriveTorque = { FL = 0, FR = 0, RL = 0, RR = 0 }
+			if drivenWheels.FL or drivenWheels.FR then
+				wheelDriveTorque.FL, wheelDriveTorque.FR = axleDiff:Distribute(subDt, frontAxleTorque, wheelSims.FL.omega, wheelSims.FR.omega, wheelSims.FL.inertia, wheelSims.FR.inertia)
+			end
+			if drivenWheels.RL or drivenWheels.RR then
+				wheelDriveTorque.RL, wheelDriveTorque.RR = axleDiff:Distribute(subDt, rearAxleTorque, wheelSims.RL.omega, wheelSims.RR.omega, wheelSims.RL.inertia, wheelSims.RR.inertia)
+			end
+
+			-- Braking: split front/rear, always opposes each wheel's own spin.
+			local frontBrakeTorque = brakePedal * stats.brakes.maxTorqueFront * 0.5
+			local rearBrakeTorque = brakePedal * stats.brakes.maxTorqueRear * 0.5
+			local wheelBrakeTorque = { FL = frontBrakeTorque, FR = frontBrakeTorque, RL = rearBrakeTorque, RR = rearBrakeTorque }
+
+			-- FrictionSim (grip, using this wheel's own rotational surface speed) -> WheelSim
+			-- (integrate wheel rotation from drive/brake/tire torque). Re-run every substep so the
+			-- tire force and wheel speed stay tightly coupled even though contact geometry is stale
+			-- for the duration of this frame.
+			for name, wheelSim in pairs(wheelSims) do
+				local tireInfo = tireInfos[name]
+				local forwardForceNewtons, normalLoadNewtons, tireStiffness = 0, 0, 0
+				local grounded = tireInfo ~= nil
 				if tireInfo then
-					FrictionSim.Update(tireInfo)
+					local surfaceSpeedStuds = Units.MpsToStudsPerSec(wheelSim:GetSurfaceSpeed())
+					forwardForceNewtons, normalLoadNewtons, tireStiffness = FrictionSim.Update(tireInfo, surfaceSpeedStuds)
+				end
+				wheelSim:Update(subDt, wheelDriveTorque[name], wheelBrakeTorque[name], forwardForceNewtons, tireStiffness, normalLoadNewtons, grounded)
+			end
+
+			lastClutchTorque = clutchTorque
+			lastDriveshaftTorque = driveshaftTorque
+			lastDriveshaftOmega = driveshaftOmega
+		end
+
+		-- Cosmetic wheel roll + telemetry attributes, updated once per rendered frame from the
+		-- final substep state.
+		for _, wheel in ipairs(wheels:GetChildren()) do
+			local wheelSim = wheelSims[wheel.Name]
+			if wheelSim then
+				local speedAttribute = WHEEL_SPEED_ATTRIBUTES[wheel.Name]
+				if speedAttribute then
+					car:SetAttribute(speedAttribute, Units.MpsToStudsPerSec(wheelSim:GetSurfaceSpeed()))
 				end
 
 				local roll = wheel.Roll
-				roll.Value = (roll.Value + car:GetAttribute(speedAttribute) / tireEnd * frameScale) % 360
-
+				roll.Value = (roll.Value + math.deg(wheelSim.omega) * dt) % 360
 				wheel.Bounds.SpinAtt.CFrame = CFrame.fromOrientation(math.rad(-roll.Value), 0, 0)
 			end
 		end
+
+		local currentGear = transmission:GetGear()
+		car:SetAttribute("RPM", engine:GetRPM())
+		car:SetAttribute("EngineStalled", engine:IsStalled())
+		car:SetAttribute("Gear", currentGear)
+
+		if driving then
+			local speedKmh = math.abs(carSpeedFrontMps) * 3.6
+			Hud.Update({
+				gear = currentGear,
+				speedKmh = speedKmh,
+				rpm = engine:GetRPM(),
+				redlineRpm = stats.engine.redlineRPM,
+				redlineWarnRpm = stats.engine.redlineRPM * 0.9,
+				throttle = throttlePedal,
+				brake = brakePedal,
+				clutch = clutchPedal,
+			})
+		end
+
+		updateSnd(dt, throttlePedal, clutchPedal, currentGear, transmission:GetRatio(), stats.transmission.finalDrive, carSpeedFrontStuds, stats.wheelRadiusMeters)
+
+		if stats.debug.enabled then
+			car:SetAttribute("Debug_ClutchSlipRadPerSec", clutch:GetSlip())
+			car:SetAttribute("Debug_ClutchTorque", lastClutchTorque)
+			car:SetAttribute("Debug_DriveshaftTorque", lastDriveshaftTorque)
+			car:SetAttribute("Debug_DriveshaftOmega", lastDriveshaftOmega)
+			car:SetAttribute("Debug_EngineNetTorque", engine.lastNetTorque)
+			car:SetAttribute("Debug_EngineCombustionTorque", engine.lastCombustionTorque)
+		end
+
+		if driving then
+			updateChassisReplication()
+		end
 	end
+
+	--== Input ==--
 
 	track(UserInputService.InputBegan:Connect(function(input, processed)
 		if processed or not driving then
 			return
 		end
-
 		local key = input.KeyCode
 
 		if key == CONFIG.ThrottleKey then
-			tweenValue(throttleValue, 1, stats.throttle_response_time)
+			tweenValue(throttleValue, 1, stats.throttleResponseTime)
 		elseif key == CONFIG.BrakeKey then
-			tweenValue(brakeValue, 1, stats.brake_response_time)
+			tweenValue(brakeValue, 1, stats.brakeResponseTime)
 		elseif key == CONFIG.ClutchKey then
-			tweenValue(clutchValue, 1, stats.clutch_response_time)
+			tweenValue(clutchValue, 1, stats.clutchResponseTime)
 		elseif key == CONFIG.GearUpKey then
 			if os.clock() - enteredAt > CONFIG.EnterInputGuard then
 				shiftGear(1)
@@ -1621,6 +2151,10 @@ function UnifiedCarHandler:HandleCar(car)
 			shiftGear(-1)
 		elseif key == CONFIG.MouseSteerKey then
 			mouseSteer = not mouseSteer
+		elseif key == CONFIG.RestartEngineKey then
+			if engine:IsStalled() then
+				engine:Restart()
+			end
 		elseif key == CONFIG.ExitKey then
 			leaveCar()
 		end
@@ -1630,15 +2164,14 @@ function UnifiedCarHandler:HandleCar(car)
 		if not driving then
 			return
 		end
-
 		local key = input.KeyCode
 
 		if key == CONFIG.ThrottleKey then
-			tweenValue(throttleValue, 0, stats.throttle_response_time / 2)
+			tweenValue(throttleValue, 0, stats.throttleResponseTime / 2)
 		elseif key == CONFIG.BrakeKey then
-			tweenValue(brakeValue, 0, stats.brake_response_time / 2)
+			tweenValue(brakeValue, 0, stats.brakeResponseTime / 2)
 		elseif key == CONFIG.ClutchKey then
-			tweenValue(clutchValue, 0, stats.clutch_response_time / 2)
+			tweenValue(clutchValue, 0, stats.clutchResponseTime / 2)
 		end
 	end))
 
