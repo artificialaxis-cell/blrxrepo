@@ -69,6 +69,13 @@ local WHEEL_SPEED_ATTRIBUTES = {
 local REQUIRED_CHILDREN = { "Wheels", "Mass", "Primary", "Throttle", "Brake", "Clutch", "Steer" }
 local REQUIRED_ATTRIBUTES = { "psi", "damper", "tirestart", "tireend" }
 
+-- Fallback CG/wheelbase constants used for longitudinal weight-transfer
+-- when a car's stats table doesn't provide cgHeightMeters / wheelbaseMeters.
+local WEIGHT_TRANSFER = {
+	defaultCgHeightMeters = 0.5,
+	defaultWheelbaseMeters = 2.6,
+}
+
 local Units = {}
 Units.StudsToMeters = 0.28
 Units.MetersToStuds = 1 / Units.StudsToMeters
@@ -600,7 +607,7 @@ end
 local Grip = {}
 
 local MU_LOOKUP = {
-	[Enum.Material.Asphalt] = 1.4, [Enum.Material.Concrete] = 1.3, [Enum.Material.Pavement] = 1.1,
+	[Enum.Material.Asphalt] = 1.3, [Enum.Material.Concrete] = 1.3, [Enum.Material.Pavement] = 1.1,
 	[Enum.Material.Grass] = 0.7, [Enum.Material.Mud] = 0.25, [Enum.Material.Sand] = 0.4,
 	[Enum.Material.Snow] = 0.2, [Enum.Material.Ice] = 0.08, [Enum.Material.Ground] = 1.0,
 	[Enum.Material.Rock] = 0.9, [Enum.Material.Salt] = 0.7, [Enum.Material.Basalt] = 0.95,
@@ -613,7 +620,7 @@ local MU_LOOKUP = {
 	[Enum.Material.ForceField] = 0.0,
 }
 
-local LONGITUDINAL = { B = 10.0, C = 1.65, E = 0.97, maxSlip = 1.0 }
+local LONGITUDINAL = { B = 10.0, C = 1.65, E = 0.7, maxSlip = 1.0 }
 local LATERAL = { B = 6.5, C = 1.30, E = 1.00, maxSlip = math.rad(18) }
 
 local LOW_SPEED_REFERENCE = 2.5
@@ -627,7 +634,10 @@ local function tireCurve(slip, params)
 	return math.sin(params.C * math.atan(bx - params.E * (bx - math.atan(bx))))
 end
 
-function Grip.Update(tireInfo, surfaceSpeedStuds, smoothedLoad, dt)
+-- axleLoadDeltaNewtons: the extra (or reduced) load, in Newtons, this wheel
+-- receives due to longitudinal weight transfer under acceleration/braking.
+-- Positive = more load (more grip available), negative = less load.
+function Grip.Update(tireInfo, surfaceSpeedStuds, smoothedLoad, dt, axleLoadDeltaNewtons)
 	local tire = tireInfo.tire
 	local car = tireInfo.car
 	local folder = tireInfo.folder
@@ -639,10 +649,11 @@ function Grip.Update(tireInfo, surfaceSpeedStuds, smoothedLoad, dt)
 	local rightDir = tire.CFrame.RightVector
 	rightDir = Vector3.new(rightDir.X, 0, rightDir.Z).Unit
 
-	local verticalLoadNewtons = ((car.Mass.AssemblyMass) * workspace.Gravity / Units.ForceScale) / 4
+	local staticLoadNewtons = ((car.Mass.AssemblyMass) * workspace.Gravity / Units.ForceScale) / 4
+	local targetLoadNewtons = math.max(staticLoadNewtons + (axleLoadDeltaNewtons or 0), 0)
 	local wheelName = tireInfo.folder.Name
-	smoothedLoad[wheelName] = smoothTo(smoothedLoad[wheelName], verticalLoadNewtons, 12, dt)
-	verticalLoadNewtons = smoothedLoad[wheelName]
+	smoothedLoad[wheelName] = smoothTo(smoothedLoad[wheelName], targetLoadNewtons, 12, dt)
+	local verticalLoadNewtons = smoothedLoad[wheelName]
 	local roadMu = MU_LOOKUP[groundMaterial] or 0.6
 
 	local contactOffset = contactPosition - tire.Position
@@ -1157,6 +1168,10 @@ function CarController:HandleCar(car)
 	local connections = {}
 	local activeTweens = {}
 	local collisionCache = {}
+
+	-- Longitudinal weight-transfer state: tracks previous-frame forward speed
+	-- so we can derive an instantaneous acceleration each step.
+	local prevStepSpeedMps = 0
 
 	local handbrakeValue = Instance.new("NumberValue")
 	handbrakeValue.Value = 0
@@ -1727,6 +1742,10 @@ function CarController:HandleCar(car)
 		end
 		dt = math.min(dt, MAX_TOTAL_DT)
 
+		handbrakeEngaged = UserInputService:IsKeyDown(Enum.KeyCode.Space)
+		tweenValue(handbrakeValue, handbrakeEngaged and 1 or 0, 0.12)
+
+
 		if driving and rootPart and rootPart.Parent and not CHASSIS_REPLICATION.Enabled then
 			rootPart.CFrame = mass.CFrame
 		end
@@ -1762,6 +1781,20 @@ function CarController:HandleCar(car)
 		local carSpeedObjectSpace = mass.CFrame:VectorToObjectSpace(velocity)
 		local carSpeedFrontStuds = carSpeedObjectSpace.Z
 		local carSpeedFrontMps = Units.StudsPerSecToMps(carSpeedFrontStuds)
+
+		-- Longitudinal weight transfer: derive instantaneous forward
+		-- acceleration and shift load from front <-> rear axle accordingly.
+		-- Accelerating (+accel) loads the rear; braking (-accel) loads the front.
+		local cgHeightMeters = stats.cgHeightMeters or WEIGHT_TRANSFER.defaultCgHeightMeters
+		local wheelbaseMeters = stats.wheelbaseMeters or WEIGHT_TRANSFER.defaultWheelbaseMeters
+
+		local longitudinalAccelMps2 = (carSpeedFrontMps - prevStepSpeedMps) / math.max(dt, 1 / 240)
+		prevStepSpeedMps = carSpeedFrontMps
+
+		local axleTransferNewtons = (massKg * longitudinalAccelMps2 * cgHeightMeters) / wheelbaseMeters
+
+		local frontLoadDeltaPerWheel = -axleTransferNewtons * 0.5
+		local rearLoadDeltaPerWheel = axleTransferNewtons * 0.5
 
 		if drag then
 			local dragForce = Vector3.zero
@@ -1855,9 +1888,9 @@ function CarController:HandleCar(car)
 				wheelDriveTorque.RL, wheelDriveTorque.RR = axleDiff:Distribute(subDt, rearAxleTorque, wheelUnits.RL.omega, wheelUnits.RR.omega, wheelUnits.RL.inertia, wheelUnits.RR.inertia)
 			end
 
-			local frontBrakeTorque = brakePedal * stats.brakes.maxTorqueFront * 0.5
-			local rearBrakeTorque = brakePedal * stats.brakes.maxTorqueRear * 0.5
-				+ handbrakeValue.Value * stats.brakes.handbrakeTorque * 0.5
+			local frontBrakeTorque = brakePedal * stats.brakes.maxTorqueFront
+			local rearBrakeTorque = brakePedal * stats.brakes.maxTorqueRear
+				+ handbrakeValue.Value * stats.brakes.handbrakeTorque
 			local wheelBrakeTorque = { FL = frontBrakeTorque, FR = frontBrakeTorque, RL = rearBrakeTorque, RR = rearBrakeTorque }
 
 			for name, wheelUnit in pairs(wheelUnits) do
@@ -1866,7 +1899,9 @@ function CarController:HandleCar(car)
 				local grounded = tireInfo ~= nil
 				if tireInfo then
 					local surfaceSpeedStuds = Units.MpsToStudsPerSec(wheelUnit:GetSurfaceSpeed())
-					forwardForceNewtons, normalLoadNewtons, tireStiffness = Grip.Update(tireInfo, surfaceSpeedStuds, smoothedLoad, subDt)
+					local isFrontWheel = (name == "FL" or name == "FR")
+					local loadDeltaNewtons = isFrontWheel and frontLoadDeltaPerWheel or rearLoadDeltaPerWheel
+					forwardForceNewtons, normalLoadNewtons, tireStiffness = Grip.Update(tireInfo, surfaceSpeedStuds, smoothedLoad, subDt, loadDeltaNewtons)
 				end
 				wheelUnit:Update(subDt, wheelDriveTorque[name], wheelBrakeTorque[name], forwardForceNewtons, tireStiffness, normalLoadNewtons, grounded)
 			end
@@ -1950,10 +1985,7 @@ function CarController:HandleCar(car)
 		elseif key == CONFIG.RestartEngineKey then
 			if engine:IsStalled() then
 				engine:Restart()
-			end
-		elseif key == CONFIG.HandbrakeKey or key == CONFIG.HandbrakeGamepadKey then
-			handbrakeEngaged = not handbrakeEngaged
-			tweenValue(handbrakeValue, handbrakeEngaged and 1 or 0, 0.12)
+			end			
 		elseif key == CONFIG.ExitKey then
 			leaveCar()
 		end
