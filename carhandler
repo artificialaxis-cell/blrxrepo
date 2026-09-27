@@ -1109,7 +1109,7 @@ function CarController:HandleCar(car)
 	raycastParams.FilterType = Enum.RaycastFilterType.Include
 	raycastParams.FilterDescendantsInstances = { workspace.Map, workspace.Built }
 
-	local stats = defaultStats(car, mass)
+	local stats = _G.ReturnStats(car, mass)
 	local massKg = stats.massKg or Units.RobloxForceToNewtons(mass.AssemblyMass)
 	print(stats.wheelRadiusMeters.. "m")
 	print(car.Mass.AssemblyMass.. " Mass")
