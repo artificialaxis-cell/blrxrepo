@@ -2029,13 +2029,12 @@ function CarController:HandleCar(car)
 			local clutchTorque
 			if totalRatio ~= 0 then
 				local requiredInputOmega = driveshaftOmega * totalRatio
-				local wheelInertiaSum = 0
+				local wheelInertiaSum = massKg * stats.wheelRadiusMeters * stats.wheelRadiusMeters
 				for name, isDriven in pairs(drivenWheels) do
 					if isDriven then
 						wheelInertiaSum += wheelUnits[name].inertia
 					end
 				end
-
 				local reflectedInertia = wheelInertiaSum / (totalRatio * totalRatio)
 				clutchTorque = clutch:Update(subDt, engine:GetAngularVelocity(), engine.inertia, requiredInputOmega, reflectedInertia, clutchPedal)
 			else
