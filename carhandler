@@ -69,13 +69,6 @@ local WHEEL_SPEED_ATTRIBUTES = {
 local REQUIRED_CHILDREN = { "Wheels", "Mass", "Primary", "Throttle", "Brake", "Clutch", "Steer" }
 local REQUIRED_ATTRIBUTES = { "psi", "damper", "tirestart", "tireend" }
 
--- Fallback CG/wheelbase constants used for longitudinal weight-transfer
--- when a car's stats table doesn't provide cgHeightMeters / wheelbaseMeters.
-local WEIGHT_TRANSFER = {
-	defaultCgHeightMeters = 0.5,
-	defaultWheelbaseMeters = 2.6,
-}
-
 local Units = {}
 Units.StudsToMeters = 0.28
 Units.MetersToStuds = 1 / Units.StudsToMeters
@@ -480,6 +473,8 @@ local SAMPLE_RADII = { 0.1, 0.2, 0.3, 0.4 }
 local DIAGONAL = math.sqrt(0.5)
 local SAMPLE_OFFSETS = {}
 local smoothedLoad = { FR = 0, FL = 0, RR = 0, RL = 0 }
+local tireLoad = { FR = 0, FL = 0, RR = 0, RL = 0 }
+local tireSlipLag = { FR = {x=0,y=0}, FL = {x=0,y=0}, RR = {x=0,y=0}, RL = {x=0,y=0} }
 
 for _, radius in ipairs(SAMPLE_RADII) do
 	table.insert(SAMPLE_OFFSETS, { radius, 0 })
@@ -620,13 +615,61 @@ local MU_LOOKUP = {
 	[Enum.Material.ForceField] = 0.0,
 }
 
-local LONGITUDINAL = { B = 10.0, C = 1.65, E = 0.7, maxSlip = 1.0 }
-local LATERAL = { B = 6.5, C = 1.30, E = 1.00, maxSlip = math.rad(18) }
+local LONGITUDINAL = {
+	Fz0 = 3000,          
+	muLoadSensitivity = 0.15,    
+	stiffnessPerNewton = 12.5,  
+	stiffnessLoadSensitivity = 0.25,
+	C = 1.7,
+	E = -0.1,                     
+	relaxationLength = 0.35,    
+	maxSlip = 1.0,
+}
+
+local LATERAL = {
+	Fz0 = 3000,
+	muLoadSensitivity = 0.22,    
+	stiffnessPerNewton = 10.0,
+	stiffnessLoadSensitivity = 0.30,
+	C = 1.38,
+	E = -0.35,                   
+	relaxationLength = 0.6,
+	maxSlip = math.rad(32),
+}
 
 local LOW_SPEED_REFERENCE = 2.5
 local STATIONARY_THRESHOLD = 0.75
 local STATIC_DAMPING = 220
 local SLIP_SMOKE_START = 0.35
+
+local function pacejkaCoeffs(axis, roadMu, Fz)
+	local loadRatio = Fz / axis.Fz0
+
+	local mu = roadMu * (1 - axis.muLoadSensitivity * (loadRatio - 1))
+	local D = math.max(mu, 0) * Fz
+
+	local stiffnessPerNewton = axis.stiffnessPerNewton * (1 - axis.stiffnessLoadSensitivity * (loadRatio - 1))
+	local BCD = math.max(stiffnessPerNewton, 0) * Fz
+
+	local C = axis.C
+	local B = BCD / math.max(C * D, 1e-6)
+
+	return B, C, D, axis.E
+end
+
+local function pacejkaForce(slip, axis, B, C, D, E)
+	local clampedSlip = math.clamp(slip, -axis.maxSlip, axis.maxSlip)
+	local Bx = B * clampedSlip
+	return D * math.sin(C * math.atan(Bx - E * (Bx - math.atan(Bx))))
+end
+
+local RELAX_FLOOR_MPS = 0.6 
+
+local function relaxedSlip(lagState, key, targetSlip, speedMps, relaxationLength, dt)
+	local rate = math.max(math.abs(speedMps), RELAX_FLOOR_MPS) / relaxationLength
+	lagState[key] = smoothTo(lagState[key] or 0, targetSlip, rate, dt)
+	return lagState[key]
+end
 
 local function tireCurve(slip, params)
 	local clampedSlip = math.clamp(slip, -params.maxSlip, params.maxSlip)
@@ -634,9 +677,6 @@ local function tireCurve(slip, params)
 	return math.sin(params.C * math.atan(bx - params.E * (bx - math.atan(bx))))
 end
 
--- axleLoadDeltaNewtons: the extra (or reduced) load, in Newtons, this wheel
--- receives due to longitudinal weight transfer under acceleration/braking.
--- Positive = more load (more grip available), negative = less load.
 function Grip.Update(tireInfo, surfaceSpeedStuds, smoothedLoad, dt, axleLoadDeltaNewtons)
 	local tire = tireInfo.tire
 	local car = tireInfo.car
@@ -651,20 +691,30 @@ function Grip.Update(tireInfo, surfaceSpeedStuds, smoothedLoad, dt, axleLoadDelt
 
 	local staticLoadNewtons = ((car.Mass.AssemblyMass) * workspace.Gravity / Units.ForceScale) / 4
 	local targetLoadNewtons = math.max(staticLoadNewtons + (axleLoadDeltaNewtons or 0), 0)
-	local wheelName = tireInfo.folder.Name
+
+	local wheelName = folder.Name
 	smoothedLoad[wheelName] = smoothTo(smoothedLoad[wheelName], targetLoadNewtons, 12, dt)
 	local verticalLoadNewtons = smoothedLoad[wheelName]
+
 	local roadMu = MU_LOOKUP[groundMaterial] or 0.6
 
 	local contactOffset = contactPosition - tire.Position
 	local velocityAtContact = tire.AssemblyLinearVelocity + tire.AssemblyAngularVelocity:Cross(contactOffset)
+
 	local longitudinalVelStuds = velocityAtContact:Dot(forwardDir)
 	local lateralVelStuds = velocityAtContact:Dot(rightDir)
 
-	local referenceSpeed = math.max(math.abs(longitudinalVelStuds), math.abs(surfaceSpeedStuds), LOW_SPEED_REFERENCE)
+	local referenceSpeed = math.max(
+		math.abs(longitudinalVelStuds),
+		math.abs(surfaceSpeedStuds),
+		LOW_SPEED_REFERENCE
+	)
 
 	local slipRatio = (surfaceSpeedStuds - longitudinalVelStuds) / referenceSpeed
-	local slipAngle = math.atan2(lateralVelStuds, math.max(math.abs(longitudinalVelStuds), LOW_SPEED_REFERENCE))
+	local slipAngle = math.atan2(
+		lateralVelStuds,
+		math.max(math.abs(longitudinalVelStuds), LOW_SPEED_REFERENCE)
+	)
 
 	slipRatio = math.clamp(slipRatio, -LONGITUDINAL.maxSlip, LONGITUDINAL.maxSlip)
 	slipAngle = math.clamp(slipAngle, -LATERAL.maxSlip, LATERAL.maxSlip)
@@ -673,10 +723,12 @@ function Grip.Update(tireInfo, surfaceSpeedStuds, smoothedLoad, dt, axleLoadDelt
 		and math.abs(surfaceSpeedStuds) < STATIONARY_THRESHOLD
 		and math.abs(lateralVelStuds) < STATIONARY_THRESHOLD
 
-	local FxMax = verticalLoadNewtons * roadMu
-	local FyMax = verticalLoadNewtons * roadMu
+	local longitudinalSpeedMps = Units.StudsPerSecToMps(longitudinalVelStuds)
 
-	if FxMax <= 0 or FyMax <= 0 then
+	local Bx, Cx, Dx, Ex = pacejkaCoeffs(LONGITUDINAL, roadMu, verticalLoadNewtons)
+	local By, Cy, Dy, Ey = pacejkaCoeffs(LATERAL, roadMu, verticalLoadNewtons)
+
+	if Dx <= 0 or Dy <= 0 then
 		tire.FrictionForce.Force = Vector3.zero
 		return 0, 0, 0
 	end
@@ -685,15 +737,46 @@ function Grip.Update(tireInfo, surfaceSpeedStuds, smoothedLoad, dt, axleLoadDelt
 
 	if isStationary then
 		local driveSlip = math.clamp(surfaceSpeedStuds / LOW_SPEED_REFERENCE, -1, 1)
-		local driveFx = tireCurve(driveSlip, LONGITUDINAL) * FxMax
+
+		local driveFx = pacejkaForce(driveSlip, LONGITUDINAL, Bx, Cx, Dx, Ex)
 		local holdFx = -longitudinalVelStuds * roadMu * STATIC_DAMPING
 		local holdFy = -lateralVelStuds * roadMu * STATIC_DAMPING
-		frictionForceNewtons = forwardDir * (driveFx + holdFx) + rightDir * holdFy
-	else
-		local Fx = tireCurve(slipRatio, LONGITUDINAL) * FxMax
-		local Fy = tireCurve(slipAngle, LATERAL) * FyMax
 
-		local ellipse = math.sqrt((Fx / FxMax) ^ 2 + (Fy / FyMax) ^ 2)
+		local totalFx = driveFx + holdFx
+		local totalFy = holdFy
+
+		local ellipse = math.sqrt((totalFx / Dx)^2 + (totalFy / Dy)^2)
+		if ellipse > 1 then
+			totalFx /= ellipse
+			totalFy /= ellipse
+		end
+
+		frictionForceNewtons = forwardDir * totalFx + rightDir * totalFy
+	else
+		tireSlipLag[wheelName] = tireSlipLag[wheelName] or { x = 0, y = 0 }
+
+		local lagX = relaxedSlip(
+			tireSlipLag[wheelName],
+			"x",
+			slipRatio,
+			longitudinalSpeedMps,
+			LONGITUDINAL.relaxationLength,
+			dt
+		)
+
+		local lagY = relaxedSlip(
+			tireSlipLag[wheelName],
+			"y",
+			slipAngle,
+			longitudinalSpeedMps,
+			LATERAL.relaxationLength,
+			dt
+		)
+
+		local Fx = pacejkaForce(lagX, LONGITUDINAL, Bx, Cx, Dx, Ex)
+		local Fy = pacejkaForce(lagY, LATERAL, By, Cy, Dy, Ey)
+
+		local ellipse = math.sqrt((Fx / Dx)^2 + (Fy / Dy)^2)
 		if ellipse > 1 then
 			Fx /= ellipse
 			Fy /= ellipse
@@ -711,23 +794,25 @@ function Grip.Update(tireInfo, surfaceSpeedStuds, smoothedLoad, dt, axleLoadDelt
 	if forceAttachment then
 		local smoke = forceAttachment:FindFirstChild("TireSmoke")
 		local skid = forceAttachment:FindFirstChild("Skid")
-		local slipping = totalSlip > SLIP_SMOKE_START and tire.AssemblyLinearVelocity.Magnitude > 1.0
+		local slipping = totalSlip > SLIP_SMOKE_START and tire.AssemblyLinearVelocity.Magnitude > 1
 
 		if smoke then
-			smoke.Rate = if slipping then 50 * math.min(totalSlip, 2) else 0
+			smoke.Rate = slipping and (50 * math.min(totalSlip, 2)) or 0
 		end
+
 		if skid then
-			skid.Volume = if slipping then 0.5 * totalSlip else 0
-			skid.PlaybackSpeed = if slipping then 0.85 + 0.4 * totalSlip else 0
+			skid.Volume = slipping and (0.5 * totalSlip) or 0
+			skid.PlaybackSpeed = slipping and (0.85 + 0.4 * totalSlip) or 0
 		end
 	end
 
-	car:SetAttribute(folder.Name .. "totalSlip", totalSlip)
+	car:SetAttribute(wheelName .. "totalSlip", totalSlip)
 
-	local stiffnessReference = if isStationary then LOW_SPEED_REFERENCE else referenceSpeed
-	local longitudinalStiffness = FxMax * (LONGITUDINAL.B * LONGITUDINAL.C) / math.max(stiffnessReference, 0.01)
+	local stiffnessReference = isStationary and LOW_SPEED_REFERENCE or referenceSpeed
+	local longitudinalStiffness = Dx * (Bx * Cx) / math.max(stiffnessReference, 0.01)
 
 	local forwardForceNewtons = frictionForceNewtons:Dot(forwardDir)
+
 	return forwardForceNewtons, verticalLoadNewtons, longitudinalStiffness
 end
 
@@ -1169,10 +1254,6 @@ function CarController:HandleCar(car)
 	local activeTweens = {}
 	local collisionCache = {}
 
-	-- Longitudinal weight-transfer state: tracks previous-frame forward speed
-	-- so we can derive an instantaneous acceleration each step.
-	local prevStepSpeedMps = 0
-
 	local handbrakeValue = Instance.new("NumberValue")
 	handbrakeValue.Value = 0
 
@@ -1249,11 +1330,14 @@ function CarController:HandleCar(car)
 	local aWhineSpd = 0
 	local idleVol, revVol, whineVol = 0, 0, 0
 	local prevSpd = 0
+	local prevStepSpeedMps = 0
 	local prevGear = transmission:GetGear()
 	local shiftTimer = 0
 	local fadeTimer = 0
 	local fadingOut = false
 	local sndStopped = true
+	local frontLoadDeltaPerWheel = 0
+	local rearLoadDeltaPerWheel = 0
 
 	local function warnMissingSnd(layerName)
 		if not sndWarned[layerName] then
@@ -1376,6 +1460,16 @@ function CarController:HandleCar(car)
 		aLoad = smoothTo(aLoad, rawLoad, SND_CFG.Load.smoothing, dt)
 
 		local carSpeedFrontMps = Units.StudsPerSecToMps(carSpeedFrontStuds)
+		local cgHeightMeters = stats.cgHeightMeters or stats.defaultCgHeightMeters
+		local wheelbaseMeters = stats.wheelbaseMeters or stats.defaultWheelbaseMeters
+
+		local longitudinalAccelMps2 = (carSpeedFrontMps - prevStepSpeedMps) / math.max(dt, 1 / 240)
+		prevStepSpeedMps = carSpeedFrontMps
+
+		local axleTransferNewtons = (massKg * longitudinalAccelMps2 * cgHeightMeters) / wheelbaseMeters
+
+		frontLoadDeltaPerWheel = -axleTransferNewtons * 0.5
+		rearLoadDeltaPerWheel = axleTransferNewtons * 0.5
 		local wheelAngularSpeed = math.abs(carSpeedFrontMps) / math.max(wheelRadiusMeters, 0.05)
 		local ratioForWhine = if gearRatio ~= 0 then math.abs(gearRatio) else 1
 		local rawDriveSpeed = wheelAngularSpeed * ratioForWhine * finalDrive * SND_CFG.Whine.driveSpeedScale
@@ -1782,19 +1876,8 @@ function CarController:HandleCar(car)
 		local carSpeedFrontStuds = carSpeedObjectSpace.Z
 		local carSpeedFrontMps = Units.StudsPerSecToMps(carSpeedFrontStuds)
 
-		-- Longitudinal weight transfer: derive instantaneous forward
-		-- acceleration and shift load from front <-> rear axle accordingly.
-		-- Accelerating (+accel) loads the rear; braking (-accel) loads the front.
-		local cgHeightMeters = stats.cgHeightMeters or WEIGHT_TRANSFER.defaultCgHeightMeters
-		local wheelbaseMeters = stats.wheelbaseMeters or WEIGHT_TRANSFER.defaultWheelbaseMeters
-
-		local longitudinalAccelMps2 = (carSpeedFrontMps - prevStepSpeedMps) / math.max(dt, 1 / 240)
-		prevStepSpeedMps = carSpeedFrontMps
-
-		local axleTransferNewtons = (massKg * longitudinalAccelMps2 * cgHeightMeters) / wheelbaseMeters
-
-		local frontLoadDeltaPerWheel = -axleTransferNewtons * 0.5
-		local rearLoadDeltaPerWheel = axleTransferNewtons * 0.5
+		local longitudinalAccelMps2 = (carSpeedFrontMps - prevStepSpeedMps) / dt
+		local transferNewtons = (massKg * longitudinalAccelMps2 * stats.cgHeightMeters) / stats.wheelbaseMeters
 
 		if drag then
 			local dragForce = Vector3.zero
