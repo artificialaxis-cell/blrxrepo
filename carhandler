@@ -1260,6 +1260,7 @@ function CarController:HandleCar(car)
 	local cameraCurrentFov = camera.FieldOfView
 	local cameraSmoothPosition = nil
 	local cameraSmoothFocus = nil
+	local cameraSmoothAccel = 0
 	local cameraShakeSeed = math.random(0, 10000)
 
 	local character, humanoid, rootPart, diedConnection
@@ -1362,10 +1363,13 @@ function CarController:HandleCar(car)
 			end
 
 			local velocity = mass.AssemblyLinearVelocity
-			local acceleration = (velocity - cameraPreviousVelocity) / math.max(dt, 1 / 240)
+			local rawAccel = (velocity - cameraPreviousVelocity) / math.max(dt, 1 / 240)
 			cameraPreviousVelocity = velocity
 
-			local forwardAccel = acceleration:Dot(mass.CFrame.LookVector)
+			local rawForwardAccel = math.clamp(rawAccel:Dot(mass.CFrame.LookVector), -60, 60)
+			cameraSmoothAccel += (rawForwardAccel - cameraSmoothAccel) * (1 - math.exp(-3 * dt))
+			local forwardAccel = cameraSmoothAccel
+
 			local speedKmh = velocity.Magnitude * Units.StudsToMeters * 3.6
 
 			local slip = (car:GetAttribute("FRtotalSlip") or 0)
@@ -1373,28 +1377,29 @@ function CarController:HandleCar(car)
 				+ (car:GetAttribute("RRtotalSlip") or 0)
 				+ (car:GetAttribute("RLtotalSlip") or 0)
 
-			local targetFov = 68 + math.clamp(speedKmh / 260, 0, 1) * 16 + math.clamp(forwardAccel / 35, 0, 1) * 6
-			cameraCurrentFov += (targetFov - cameraCurrentFov) * (1 - math.exp(-6 * dt))
+			local targetFov = 68 + math.clamp(speedKmh / 260, 0, 1) * 10 + math.clamp(forwardAccel / 35, 0, 1) * 4
+			cameraCurrentFov += (targetFov - cameraCurrentFov) * (1 - math.exp(-3 * dt))
 			camera.FieldOfView = cameraCurrentFov
 
-			local dynamicDistance = cameraDistance + math.clamp(speedKmh / 300, 0, 1) * 8
+			local dynamicDistance = cameraDistance + math.clamp(speedKmh / 300, 0, 1) * 6
 			local focus = mass.Position + Vector3.new(0, 2.6, 0)
 			local orbitCFrame = CFrame.new(focus) * CFrame.Angles(0, cameraOrbitAlpha, 0) * CFrame.Angles(cameraOrbitBeta, 0, 0)
 			local desiredPosition = orbitCFrame * CFrame.new(0, 0, dynamicDistance)
 
-			local pullback = math.clamp(-forwardAccel / 30, -1, 1) * 2.2
+			local pullback = math.clamp(-forwardAccel / 30, -1, 1) * 1.2
 			desiredPosition += orbitCFrame.LookVector * pullback
 
-			local shakeMagnitude = math.clamp(slip * 0.35, 0, 1) * 0.4
+			local shakeInput = math.max(math.clamp(slip, 0, 4) - 1.2, 0)
+			local shakeMagnitude = math.clamp(shakeInput * 0.25, 0, 1) * 0.12
 			local t = os.clock()
-			local shakeOffset = camera.CFrame.RightVector * math.noise(t * 19, cameraShakeSeed) * shakeMagnitude
-				+ camera.CFrame.UpVector * math.noise(t * 23, cameraShakeSeed + 40) * shakeMagnitude
+			local shakeOffset = camera.CFrame.RightVector * math.noise(t * 7, cameraShakeSeed) * shakeMagnitude
+				+ camera.CFrame.UpVector * math.noise(t * 8, cameraShakeSeed + 40) * shakeMagnitude
 
 			cameraSmoothPosition = cameraSmoothPosition or desiredPosition.Position
 			cameraSmoothFocus = cameraSmoothFocus or focus
 
-			cameraSmoothPosition = cameraSmoothPosition:Lerp(desiredPosition.Position, 1 - math.exp(-10 * dt))
-			cameraSmoothFocus = cameraSmoothFocus:Lerp(focus, 1 - math.exp(-12 * dt))
+			cameraSmoothPosition = cameraSmoothPosition:Lerp(desiredPosition.Position, 1 - math.exp(-6 * dt))
+			cameraSmoothFocus = cameraSmoothFocus:Lerp(focus, 1 - math.exp(-8 * dt))
 
 			camera.CFrame = CFrame.lookAt(cameraSmoothPosition + shakeOffset, cameraSmoothFocus)
 		end)
