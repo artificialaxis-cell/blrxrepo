@@ -1249,6 +1249,19 @@ function CarController:HandleCar(car)
 	local mouseSteer = false
 	local handbrakeEngaged = false
 
+	local camera = workspace.CurrentCamera
+	local cameraActive = false
+	local cameraBindName = "OrbitCamera_" .. tostring(car)
+	local cameraOrbitAlpha = 0
+	local cameraOrbitBeta = 0.32
+	local cameraDistance = 20
+	local cameraRightMouseDown = false
+	local cameraPreviousVelocity = Vector3.zero
+	local cameraCurrentFov = camera.FieldOfView
+	local cameraSmoothPosition = nil
+	local cameraSmoothFocus = nil
+	local cameraShakeSeed = math.random(0, 10000)
+
 	local character, humanoid, rootPart, diedConnection
 	local connections = {}
 	local activeTweens = {}
@@ -1318,6 +1331,86 @@ function CarController:HandleCar(car)
 			+ Vector3.yAxis * CONFIG.ExitHeight
 
 		return CFrame.lookAt(position, position + lookVector)
+	end
+
+	local function startCamera()
+		if cameraActive then
+			return
+		end
+		cameraActive = true
+		cameraPreviousVelocity = mass.AssemblyLinearVelocity
+		cameraCurrentFov = camera.FieldOfView
+		cameraSmoothPosition = nil
+		cameraSmoothFocus = nil
+		camera.CameraType = Enum.CameraType.Scriptable
+
+		RunService:BindToRenderStep(cameraBindName, Enum.RenderPriority.Camera.Value + 1, function(dt)
+			if not (car:IsDescendantOf(workspace) and mass.Parent) then
+				cameraActive = false
+				RunService:UnbindFromRenderStep(cameraBindName)
+				return
+			end
+
+			if not cameraRightMouseDown then
+				local lookVector = mass.CFrame.LookVector
+				local flatLook = Vector3.new(lookVector.X, 0, lookVector.Z)
+				if flatLook.Magnitude > 0.02 then
+					local targetAlpha = math.atan2(-flatLook.X, -flatLook.Z)
+					local diff = math.atan2(math.sin(targetAlpha - cameraOrbitAlpha), math.cos(targetAlpha - cameraOrbitAlpha))
+					cameraOrbitAlpha += diff * (1 - math.exp(-1.4 * dt))
+				end
+			end
+
+			local velocity = mass.AssemblyLinearVelocity
+			local acceleration = (velocity - cameraPreviousVelocity) / math.max(dt, 1 / 240)
+			cameraPreviousVelocity = velocity
+
+			local forwardAccel = acceleration:Dot(mass.CFrame.LookVector)
+			local speedKmh = velocity.Magnitude * Units.StudsToMeters * 3.6
+
+			local slip = (car:GetAttribute("FRtotalSlip") or 0)
+				+ (car:GetAttribute("FLtotalSlip") or 0)
+				+ (car:GetAttribute("RRtotalSlip") or 0)
+				+ (car:GetAttribute("RLtotalSlip") or 0)
+
+			local targetFov = 68 + math.clamp(speedKmh / 260, 0, 1) * 16 + math.clamp(forwardAccel / 35, 0, 1) * 6
+			cameraCurrentFov += (targetFov - cameraCurrentFov) * (1 - math.exp(-6 * dt))
+			camera.FieldOfView = cameraCurrentFov
+
+			local dynamicDistance = cameraDistance + math.clamp(speedKmh / 300, 0, 1) * 8
+			local focus = mass.Position + Vector3.new(0, 2.6, 0)
+			local orbitCFrame = CFrame.new(focus) * CFrame.Angles(0, cameraOrbitAlpha, 0) * CFrame.Angles(cameraOrbitBeta, 0, 0)
+			local desiredPosition = orbitCFrame * CFrame.new(0, 0, dynamicDistance)
+
+			local pullback = math.clamp(-forwardAccel / 30, -1, 1) * 2.2
+			desiredPosition += orbitCFrame.LookVector * pullback
+
+			local shakeMagnitude = math.clamp(slip * 0.35, 0, 1) * 0.4
+			local t = os.clock()
+			local shakeOffset = camera.CFrame.RightVector * math.noise(t * 19, cameraShakeSeed) * shakeMagnitude
+				+ camera.CFrame.UpVector * math.noise(t * 23, cameraShakeSeed + 40) * shakeMagnitude
+
+			cameraSmoothPosition = cameraSmoothPosition or desiredPosition.Position
+			cameraSmoothFocus = cameraSmoothFocus or focus
+
+			cameraSmoothPosition = cameraSmoothPosition:Lerp(desiredPosition.Position, 1 - math.exp(-10 * dt))
+			cameraSmoothFocus = cameraSmoothFocus:Lerp(focus, 1 - math.exp(-12 * dt))
+
+			camera.CFrame = CFrame.lookAt(cameraSmoothPosition + shakeOffset, cameraSmoothFocus)
+		end)
+	end
+
+	local function stopCamera()
+		if not cameraActive then
+			return
+		end
+		cameraActive = false
+		RunService:UnbindFromRenderStep(cameraBindName)
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		if camera and camera.Parent then
+			camera.CameraType = Enum.CameraType.Custom
+			camera.FieldOfView = 70
+		end
 	end
 
 	local idleSnd, revSnd, whineSnd
@@ -1690,6 +1783,7 @@ function CarController:HandleCar(car)
 		end
 		driving = false
 		Hud.SetVisible(false)
+		stopCamera()
 
 		local exitCFrame = computeExitCFrame()
 		releaseControls(true)
@@ -1726,6 +1820,7 @@ function CarController:HandleCar(car)
 		end
 		alive = false
 		stopSndNow()
+		stopCamera()
 
 		for _, connection in connections do
 			connection:Disconnect()
@@ -1755,6 +1850,7 @@ function CarController:HandleCar(car)
 		alive = false
 		teardownChassisReplication()
 		stopSndNow()
+		stopCamera()
 
 		for _, connection in connections do
 			connection:Disconnect()
@@ -1809,6 +1905,7 @@ function CarController:HandleCar(car)
 
 		Hud.SetVisible(true)
 		startSnd()
+		startCamera()
 
 		diedConnection = currentHumanoid.Died:Connect(onDriverDied)
 	end
@@ -2071,6 +2168,9 @@ function CarController:HandleCar(car)
 			end			
 		elseif key == CONFIG.ExitKey then
 			leaveCar()
+		elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+			cameraRightMouseDown = true
+			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
 		end
 	end))
 
@@ -2086,6 +2186,21 @@ function CarController:HandleCar(car)
 			tweenValue(brakeValue, 0, stats.brakeResponseTime / 2)
 		elseif key == CONFIG.ClutchKey then
 			tweenValue(clutchValue, 0, stats.clutchResponseTime / 2)
+		elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+			cameraRightMouseDown = false
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		end
+	end))
+
+	track(UserInputService.InputChanged:Connect(function(input)
+		if not driving then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement and cameraRightMouseDown then
+			cameraOrbitAlpha -= input.Delta.X * 0.0085
+			cameraOrbitBeta = math.clamp(cameraOrbitBeta - input.Delta.Y * 0.0085, -1.1, 1.3)
+		elseif input.UserInputType == Enum.UserInputType.MouseWheel then
+			cameraDistance = math.clamp(cameraDistance - input.Position.Z * 3, 7, 45)
 		end
 	end))
 
